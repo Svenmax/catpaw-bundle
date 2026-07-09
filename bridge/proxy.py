@@ -256,7 +256,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
         else:
+            reasoning = message.get("reasoning", "") or ""
             content = message.get("content", "") or ""
+
+            if reasoning:
+                chunk = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {"reasoning": reasoning}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+
             chunk_size = 20
             for i in range(0, len(content), chunk_size):
                 piece = content[i:i + chunk_size]
@@ -342,6 +350,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """Convert CatPaw streaming chunk to OpenAI format."""
         catpaw_data = data.get("data", data)
         content = ""
+        reasoning = ""
         finish_reason = None
 
         choices = catpaw_data.get("choices", [])
@@ -350,6 +359,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             delta = choice.get("delta")
             if delta and isinstance(delta, dict):
                 content = delta.get("content", "")
+                reasoning = delta.get("reasoning", "") or delta.get("reasoning_content", "")
             finish_reason = choice.get("finishReason") or choice.get("finish_reason")
 
         if not content and not finish_reason:
@@ -357,8 +367,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if top_content:
                 content = top_content
 
-        if not content and not finish_reason:
+        if not content and not reasoning and not finish_reason:
             return None
+
+        delta = {}
+        if content:
+            delta["content"] = content
+        if reasoning:
+            delta["reasoning"] = reasoning
 
         return {
             "id": catpaw_data.get("id", f"chatcmpl-{uuid.uuid4().hex[:12]}"),
@@ -367,7 +383,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "model": model,
             "choices": [{
                 "index": 0,
-                "delta": {"content": content} if content else {},
+                "delta": delta,
                 "finish_reason": finish_reason,
             }],
         }
@@ -377,17 +393,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
         data = catpaw_resp.get("data", catpaw_resp)
         choices = data.get("choices", [])
         content = data.get("content", "")
+        reasoning = data.get("reasoning", "") or data.get("reasoning_content", "")
         finish_reason = "stop"
 
         if choices:
             ch = choices[0]
+            msg = ch.get("message", {})
             if not content:
-                content = ch.get("message", {}).get("content", "")
+                content = msg.get("content", "")
+            if not reasoning:
+                reasoning = msg.get("reasoning", "") or msg.get("reasoning_content", "")
             finish_reason = ch.get("finishReason") or ch.get("finish_reason") or "stop"
 
         remaining_content, tool_calls = parse_tool_calls_from_content(content)
 
         message = {"role": "assistant", "content": remaining_content if remaining_content else None}
+        if reasoning:
+            message["reasoning"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
             finish_reason = "tool_calls"
