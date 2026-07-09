@@ -66,7 +66,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
         error_data = {"error": {"message": msg, "type": "proxy_error"}}
         self.wfile.write(f"data: {json.dumps(error_data)}\n\n".encode())
@@ -223,7 +223,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
 
         choice = openai_resp["choices"][0]
@@ -231,6 +231,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finish_reason = choice["finish_reason"]
         chunk_id = openai_resp["id"]
         created = openai_resp["created"]
+
+        # Send initial role chunk
+        role_chunk = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                      "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
+        self.wfile.write(f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
 
         if message.get("tool_calls"):
             for i, tc in enumerate(message["tool_calls"]):
@@ -274,7 +280,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
 
         resp_headers = dict(resp.getheaders())
