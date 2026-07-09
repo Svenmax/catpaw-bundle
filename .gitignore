@@ -1,0 +1,18 @@
+# CatPaw IDE 二进制（作为 Release 附件）
+CatPaw-linux.tar.xz
+CatPaw-linux/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

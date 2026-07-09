@@ -1,0 +1,231 @@
+# CatPaw Bridge - OpenAI Compatible Proxy
+
+将 [CatPaw IDE](https://catpaw.meituan.com) 的私有 LLM API 桥接为标准 OpenAI 兼容端点，供 [Hermes Agent](https://github.com/) 或其他支持 OpenAI API 的工具调用。
+
+## ✨ 特性
+
+- **OpenAI 兼容**：对外暴露标准 `/v1/chat/completions` 和 `/v1/models` 端点
+- **自动加解密**：RSA-OAEP + AES-128-ECB，与 CatPaw 插件一致
+- **SSO 认证**：自动从 CatPaw IDE 的本地数据库读取 access token
+- **智能工具过滤**：根据用户问题动态选择相关工具，不再注入全部 127 个工具
+- **Tool Calling 翻译层**：CatPaw API 不支持原生 `tools` 参数，通过 prompt 注入 + 响应解析实现
+- **Token 精确计数**：使用 `tiktoken` 进行准确的 token 计数（非字符估算）
+- **智能上下文管理**：工具结果摘要而非粗暴截断，自动保留最近对话
+- **流式响应**：支持 SSE 流式输出
+- **YAML 配置**：所有参数通过 `config.yaml` 配置，不再硬编码
+- **模块化架构**：各功能模块独立，便于维护和扩展
+
+## 项目结构
+
+```
+catpaw-bridge/
+├── proxy.py                 # 主入口 - HTTP 服务器
+├── config.yaml              # 配置文件
+├── requirements.txt         # Python 依赖
+├── src/
+│   ├── __init__.py
+│   ├── config.py            # 配置加载器
+│   ├── crypto.py            # RSA/AES 加解密模块
+│   ├── token_manager.py     # SSO token 管理
+│   ├── catpaw_client.py     # CatPaw API 客户端
+│   ├── tool_filter.py       # 智能工具过滤
+│   ├── tool_translator.py   # Tool calling 翻译层
+│   ├── token_counter.py     # Token 计数 (tiktoken)
+│   └── context_manager.py   # 上下文管理 + 智能截断
+└── README.md
+```
+
+## 支持的模型
+
+| 模型 | 说明 |
+|------|------|
+| `glm-5.2` | 智谱 GLM-5.2 |
+| `glm-5.1` | 智谱 GLM-5.1 |
+| `deepseek-v3.2` | DeepSeek V3.2 |
+| `kimi-k2.6` | Kimi K2.6 |
+| `kimi-k2.5` | Kimi K2.5 |
+| `minimax-m2.7` | MiniMax M2.7 |
+| `longcat-2.0` | LongCat 2.0 |
+| `longcat-flash` | LongCat Flash |
+
+## 架构原理
+
+```
+Hermes Agent                CatPaw Bridge                       CatPaw API
+    │                            │                                  │
+    │ POST /v1/chat/completions  │                                  │
+    │ (OpenAI format + tools)    │                                  │
+    │ ─────────────────────────> │                                  │
+    │                            │ 1. Smart filter: 127 tools → 15  │
+    │                            │ 2. Inject tools to system prompt │
+    │                            │ 3. Token-based context truncate  │
+    │                            │ 4. AES+RSA encrypt request       │
+    │                            │ ───────────────────────────────> │
+    │                            │                                  │
+    │                            │ 5. RSA+AES decrypt response      │
+    │                            │ 6. Parse <tool_call> tags        │
+    │                            │ 7. Convert to OpenAI tool_calls  │
+    │                            │ <─────────────────────────────── │
+    │ (标准 OpenAI 响应)          │                                  │
+    │ <───────────────────────── │                                  │
+```
+
+### 智能工具过滤
+
+当 Hermes 发送 127 个工具时，不再全部注入 system prompt（会撑爆上下文），而是：
+
+1. **始终包含核心工具**：`terminal_exec`、`file_read`、`file_write` 等
+2. **关键词匹配**：扫描用户最近 5 条消息，匹配工具类别
+   - 用户问"硬盘" → 包含 `terminal_exec`、`file_list`
+   - 用户问"飞书文档" → 包含 `feishu_*` 系列工具
+   - 用户问"浏览器" → 包含 `browser_*` 系列工具
+3. **结果**：从 127 个工具（15000+ 字符）减少到 10-20 个（2000-3000 字符）
+
+### 上下文管理
+
+- **Token 精确计数**：使用 `tiktoken`（GPT-4 同款分词器）准确计算 token 数
+- **智能摘要**：工具结果不再粗暴截断，而是保留首尾关键行 + 中间省略
+- **历史截断**：保留 system prompt + 最近对话，自动截断旧消息
+- **工具结果限制**：单个工具结果最多 3000 字符
+
+## 快速开始
+
+### 前置条件
+
+- 已安装并登录 [CatPaw IDE](https://catpaw.meituan.com)
+- Python 3.10+
+- 网络可访问 `catpaw.meituan.com`（公网可达，不需要 VPN）
+
+### 安装
+
+```bash
+git clone https://github.com/fifasheng-tech/catpaw-bridge.git
+cd catpaw-bridge
+pip install -r requirements.txt
+```
+
+### 配置
+
+编辑 `config.yaml`，或设置环境变量：
+
+```bash
+# 可选：从 CatPaw IDE 插件源码中获取这些值
+export CATPAW_MIS_ID="your_mis_id"
+export CATPAW_TENANT="your_tenant_id"
+export CATPAW_PASSPORT_KEY="your_passport_key"
+export CATPAW_SSO_KEY="your_sso_key"
+```
+
+### 启动
+
+```bash
+python proxy.py
+# 或指定配置文件
+python proxy.py --config /path/to/config.yaml
+```
+
+### 验证
+
+```bash
+# 健康检查
+curl http://127.0.0.1:4567/health
+
+# 查看可用模型
+curl http://127.0.0.1:4567/v1/models
+
+# 发送聊天请求
+curl http://127.0.0.1:4567/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5.2",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# 带工具调用
+curl http://127.0.0.1:4567/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5.2",
+    "messages": [{"role": "user", "content": "查看磁盘空间"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "terminal_exec",
+        "description": "Execute a terminal command",
+        "parameters": {
+          "type": "object",
+          "properties": {"command": {"type": "string"}},
+          "required": ["command"]
+        }
+      }
+    }]
+  }'
+```
+
+### 配置 Hermes Agent
+
+在 Hermes 的 `config.yaml` 中添加：
+
+```yaml
+providers:
+  catpaw:
+    type: openai
+    base_url: http://127.0.0.1:4567/v1
+    api_key: any-string
+    models:
+      glm-5.2:
+        context_length: 262144
+```
+
+### Launchd 自启服务（macOS）
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.catpaw.bridge-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/python3</string>
+        <string>/path/to/catpaw-bridge/proxy.py</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardErrorPath</key><string>/tmp/catpaw-proxy.log</string>
+    <key>StandardOutPath</key><string>/tmp/catpaw-proxy.log</string>
+</dict>
+</plist>
+```
+
+## API 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/chat/completions` | POST | OpenAI 兼容的聊天补全接口 |
+| `/v1/models` | GET | 返回可用模型列表 |
+| `/health` | GET | 健康检查，返回 token 状态 |
+
+## 配置项
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `server.host` | 127.0.0.1 | 监听地址 |
+| `server.port` | 4567 | 监听端口 |
+| `context.max_total_tokens` | 8000 | CatPaw API 的 token 限制 |
+| `context.max_system_prompt` | 3000 | 原始 system prompt 最大字符数 |
+| `context.max_tool_result` | 3000 | 单个工具结果最大字符数 |
+| `context.max_tool_prompt` | 4000 | 工具列表注入最大字符数 |
+| `tools.always_include` | [...] | 始终注入的核心工具列表 |
+
+## ⚠️ 免责声明
+
+本项目仅供学习和研究用途。使用前请确保：
+1. 你已了解并遵守 CatPaw IDE 的使用条款
+2. 你不会将代理用于商业用途或分享给他人
+3. 敏感信息（MIS ID、tenant 等）已通过环境变量配置，不要硬编码
+
+## License
+
+MIT
