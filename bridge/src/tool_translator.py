@@ -15,6 +15,21 @@ import uuid
 from typing import List, Dict, Any, Tuple, Optional
 
 
+# ── Tool name mapping ────────────────────────────────────────────────
+# Map tool names from consumer (Hermes) to environment-compatible names
+TOOL_NAME_MAP = {
+    "terminal_exec": "bash",
+}
+
+TOOL_NAME_MAP_REVERSE = {v: k for k, v in TOOL_NAME_MAP.items()}
+
+
+def map_tool_name(name: str, reverse: bool = False) -> str:
+    """Map tool name between consumer and environment names."""
+    mapping = TOOL_NAME_MAP_REVERSE if reverse else TOOL_NAME_MAP
+    return mapping.get(name, name)
+
+
 # ── Tool prompt construction ──────────────────────────────────────────
 
 # Priority ordering: core tools first
@@ -39,15 +54,15 @@ def build_tool_system_prefix() -> str:
         "\n"
         "## Examples\n"
         'User: check disk space\n'
-        '<tool_call>{"name":"terminal_exec","arguments":{"command":"df -h"}}</tool_call>\n'
+        '<tool_call>{"name":"bash","arguments":{"command":"df -h"}}</tool_call>\n'
         'User: list files in /tmp\n'
-        '<tool_call>{"name":"terminal_exec","arguments":{"command":"ls -la /tmp"}}</tool_call>\n'
+        '<tool_call>{"name":"bash","arguments":{"command":"ls -la /tmp"}}</tool_call>\n'
         'User: read file /etc/hosts\n'
         '<tool_call>{"name":"file_read","arguments":{"target_file":"/etc/hosts"}}</tool_call>\n'
         "\n"
         "## Rules\n"
         "1. ALWAYS call a tool when the user asks you to DO something.\n"
-        "2. Use terminal_exec for system commands (df, du, ls, cat, ps, etc.)\n"
+        "2. Use bash for system commands (df, du, ls, cat, ps, etc.)\n"
         "3. Use file_read/file_write/file_list for file operations.\n"
         "4. After receiving tool results, analyze them and respond. Call more tools if needed.\n"
         "5. Do NOT ask for permission to use tools. Just use them.\n"
@@ -72,7 +87,7 @@ def build_tool_prompt(tools: List[dict], max_chars: int = 4000) -> str:
         if tool.get("type") != "function":
             continue
         func = tool.get("function", {})
-        name = func.get("name", "")
+        name = map_tool_name(func.get("name", ""))
         desc = func.get("description", "")
         if len(desc) > 60:
             desc = desc[:60] + "..."
@@ -136,6 +151,18 @@ def convert_messages_with_tools(
     2. Convert tool-role messages to user messages
     3. Convert assistant tool_calls to text format
     """
+    def _normalize_content(val) -> str:
+        """Convert content (which may be str or list) to plain string."""
+        if isinstance(val, str):
+            return val
+        if isinstance(val, list):
+            parts = []
+            for chunk in val:
+                if isinstance(chunk, dict) and chunk.get("type") == "text":
+                    parts.append(chunk.get("text", ""))
+            return "\n".join(parts)
+        return str(val) if val else ""
+
     tool_prefix = build_tool_system_prefix()
     tool_suffix = build_tool_prompt(tools, max_tool_prompt_chars)
     converted = []
@@ -144,7 +171,7 @@ def convert_messages_with_tools(
         role = msg.get("role", "")
 
         if role == "system":
-            content = msg.get("content", "")
+            content = _normalize_content(msg.get("content", ""))
             if len(content) > max_system_chars:
                 content = content[:max_system_chars] + "\n...(system prompt truncated)"
             content = tool_prefix + content + tool_suffix
@@ -161,17 +188,17 @@ def convert_messages_with_tools(
 
         elif role == "tool":
             tool_call_id = msg.get("tool_call_id", "")
-            content = msg.get("content", "")
+            content = _normalize_content(msg.get("content", ""))
             converted.append({
                 "role": "user",
                 "content": f"[Tool Result: {tool_call_id}]\n{content}"
             })
 
         elif role == "assistant" and msg.get("tool_calls"):
-            content = msg.get("content", "") or ""
+            content = _normalize_content(msg.get("content", "") or "")
             for tc in msg.get("tool_calls", []):
                 func = tc.get("function", {})
-                name = func.get("name", "")
+                name = map_tool_name(func.get("name", ""))
                 args = func.get("arguments", "{}")
                 if isinstance(args, str):
                     try:
@@ -183,6 +210,8 @@ def convert_messages_with_tools(
             converted.append({"role": "assistant", "content": content.strip()})
 
         else:
+            msg = dict(msg)
+            msg["content"] = _normalize_content(msg.get("content", ""))
             converted.append(msg)
 
     # If no system message, add one
@@ -234,6 +263,9 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
     2. Code blocks with function-call syntax (func_name(key='value'))
     3. Code blocks with shell commands (converted to terminal_exec)
     """
+    if not content:
+        return "", []
+
     tool_calls = []
 
     # Method 1: <tool_call> tags with brace counting
@@ -266,7 +298,7 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
                         "id": f"call_{uuid.uuid4().hex[:24]}",
                         "type": "function",
                         "function": {
-                            "name": name,
+                            "name": map_tool_name(name, reverse=True),
                             "arguments": json.dumps(args, ensure_ascii=False)
                         }
                     })
@@ -276,7 +308,7 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
                         tool_calls.append({
                             "id": f"call_{uuid.uuid4().hex[:24]}",
                             "type": "function",
-                            "function": {"name": name_match.group(1), "arguments": "{}"}
+                            "function": {"name": map_tool_name(name_match.group(1), reverse=True), "arguments": "{}"}
                         })
 
         remaining = re.sub(r'<tool_call>.*?(?:</tool_call>|(?=\n\n|\Z))', '', content, flags=re.DOTALL).strip()
@@ -302,6 +334,8 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
                         for kv in kv_pattern.finditer(args_str):
                             key = kv.group(1)
                             val = kv.group(2) or kv.group(3) or kv.group(4)
+                            if val is None:
+                                continue
                             val = val.strip()
                             if val.lower() == 'true':
                                 val = True
@@ -323,7 +357,7 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
                             "id": f"call_{uuid.uuid4().hex[:24]}",
                             "type": "function",
                             "function": {
-                                "name": name,
+                                "name": map_tool_name(name, reverse=True),
                                 "arguments": json.dumps(args, ensure_ascii=False)
                             }
                         })

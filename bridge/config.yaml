@@ -23,7 +23,7 @@ models:
 
 # Context management
 context:
-  max_total_tokens: 8000       # CatPaw API 的大致 token 限制
+  max_total_tokens: 32000       # CatPaw API 的大致 token 限制
   max_system_prompt: 3000      # 原始 system prompt 保留的最大字符数
   max_tool_result: 3000        # 单个工具结果的最大字符数
   max_tool_prompt: 4000        # 工具列表注入的最大字符数
@@ -61,5 +61,5 @@ tools:
 
 # Logging
 logging:
-  level: INFO  # DEBUG | INFO | WARNING | ERROR
+  level: DEBUG  # DEBUG | INFO | WARNING | ERROR
   file: /tmp/catpaw-proxy.log

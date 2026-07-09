@@ -4,10 +4,14 @@ import http.client
 import json
 import ssl
 import sys
+import time
 from typing import Dict, Any, Tuple
 
 from .crypto import encrypt_request_body, decrypt_response_body
 from .token_manager import TokenManager
+
+MAX_RETRIES = 3
+RETRY_DELAY = 1
 
 
 class CatPawClient:
@@ -27,8 +31,8 @@ class CatPawClient:
             raise RuntimeError("CatPaw token not found. Make sure CatPaw IDE is logged in.")
         return token
 
-    def call(self, request_body: dict) -> dict:
-        """Send encrypted request and return decrypted JSON response."""
+    def _do_call(self, request_body: dict) -> dict:
+        """Send encrypted request and return decrypted JSON response (single attempt)."""
         token = self._get_token()
         plaintext = json.dumps(request_body, ensure_ascii=False)
         encrypted_body, encrypted_key = encrypt_request_body(plaintext)
@@ -42,10 +46,11 @@ class CatPawClient:
         status = resp.status
         conn.close()
 
+        if status == 401:
+            raise AuthError(f"CatPaw API auth failed: {resp_body[:500]}")
         if status != 200:
             raise RuntimeError(f"CatPaw API returned HTTP {status}: {resp_body[:500]}")
 
-        # Check if response is encrypted
         resp_enc_key = resp_headers.get("encrypted-key")
         if resp_enc_key:
             encrypted_data = resp_body.strip('"')
@@ -54,16 +59,46 @@ class CatPawClient:
         else:
             return json.loads(resp_body)
 
-    def call_stream(self, request_body: dict) -> Tuple[http.client.HTTPResponse, http.client.HTTPSConnection]:
-        """Send encrypted request for streaming response. Returns (response, connection)."""
-        token = self._get_token()
-        request_body["stream"] = True
-        plaintext = json.dumps(request_body, ensure_ascii=False)
-        encrypted_body, encrypted_key = encrypt_request_body(plaintext)
-        headers = self.token_manager.build_headers(token, encrypted_key)
-        headers["Accept"] = "text/event-stream"
+    def call(self, request_body: dict) -> dict:
+        """Send encrypted request with auto-retry on auth failure."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                return self._do_call(request_body)
+            except AuthError:
+                if attempt < MAX_RETRIES - 1:
+                    print(f"[WARN] Auth failed, refreshing token and retrying ({attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                    self.token_manager.refresh_token()
+                    time.sleep(RETRY_DELAY)
+                else:
+                    raise RuntimeError(f"CatPaw API auth failed after {MAX_RETRIES} retries")
 
-        conn = http.client.HTTPSConnection(self.host, context=self._ssl_ctx)
-        conn.request("POST", self.path, encrypted_body, headers)
-        resp = conn.getresponse()
-        return resp, conn
+    def call_stream(self, request_body: dict) -> Tuple[http.client.HTTPResponse, http.client.HTTPSConnection]:
+        """Send encrypted request for streaming response with auto-retry on auth failure."""
+        for attempt in range(MAX_RETRIES):
+            token = self._get_token()
+            request_body["stream"] = True
+            plaintext = json.dumps(request_body, ensure_ascii=False)
+            encrypted_body, encrypted_key = encrypt_request_body(plaintext)
+            headers = self.token_manager.build_headers(token, encrypted_key)
+            headers["Accept"] = "text/event-stream"
+
+            conn = http.client.HTTPSConnection(self.host, context=self._ssl_ctx)
+            conn.request("POST", self.path, encrypted_body, headers)
+            resp = conn.getresponse()
+
+            if resp.status == 401:
+                resp_body = resp.read().decode("utf-8")
+                conn.close()
+                if attempt < MAX_RETRIES - 1:
+                    print(f"[WARN] Auth failed, refreshing token and retrying ({attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                    self.token_manager.refresh_token()
+                    time.sleep(RETRY_DELAY)
+                else:
+                    raise RuntimeError(f"CatPaw API auth failed after {MAX_RETRIES} retries")
+            else:
+                return resp, conn
+
+
+class AuthError(Exception):
+    """Raised when CatPaw API returns 401."""
+    pass

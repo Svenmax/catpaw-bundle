@@ -57,6 +57,11 @@ class TokenManager:
         now = time.time()
         if self._cache["value"] and now - self._cache["ts"] < self.ttl:
             return self._cache["value"]
+        return self.refresh_token()
+
+    def refresh_token(self) -> Optional[str]:
+        """Force refresh token from DB, bypassing cache."""
+        now = time.time()
 
         try:
             conn = sqlite3.connect(self.state_db)

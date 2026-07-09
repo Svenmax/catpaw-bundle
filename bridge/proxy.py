@@ -175,9 +175,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             elif stream and tools:
                 self._handle_stream_with_tools(api_body, model)
             else:
-                self._handle_non_stream(api_body, model)
+                self._handle_non_stream(api_body, model, bool(tools))
         except Exception as e:
-            print(f"[ERROR] Proxy error: {e}", file=sys.stderr)
+            import traceback
+            print(f"[ERROR] Proxy error: {e}\n{traceback.format_exc()}", file=sys.stderr)
             try:
                 self._send_json(500, {"error": {"message": str(e), "type": "proxy_error"}})
             except Exception:
@@ -185,20 +186,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── Response handlers ────────────────────────────────────────────
 
-    def _handle_non_stream(self, api_body: dict, model: str):
+    def _handle_non_stream(self, api_body: dict, model: str, has_tools: bool = False):
         """Handle non-streaming request."""
         result = self.catpaw_client.call(api_body)
 
         if result.get("code") != 0:
-            raise RuntimeError(f"CatPaw API error: {result.get('msg', 'unknown')}")
+            import json as _json
+            err_detail = _json.dumps(result, ensure_ascii=False)[:500]
+            raise RuntimeError(f"CatPaw API error: {result.get('msg', 'unknown')}. Full response: {err_detail}")
 
         raw_data = result.get("data", result)
-        raw_content = raw_data.get("content", "")
+        raw_content = raw_data.get("content", "") or ""
         if not raw_content and raw_data.get("choices"):
-            raw_content = raw_data["choices"][0].get("message", {}).get("content", "")
+            raw_content = raw_data["choices"][0].get("message", {}).get("content", "") or ""
         print(f"[DEBUG] Raw model response: {raw_content[:500]}", file=sys.stderr)
 
-        openai_resp = self._to_openai_response(result, model)
+        openai_resp = self._to_openai_response(result, model, has_tools)
         print(f"[DEBUG] Parsed tool_calls: {len(openai_resp['choices'][0]['message'].get('tool_calls', []))}", file=sys.stderr)
         self._send_json(200, openai_resp)
 
@@ -208,15 +211,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         result = self.catpaw_client.call(api_body)
 
         if result.get("code") != 0:
-            raise RuntimeError(f"CatPaw API error: {result.get('msg', 'unknown')}")
-
+            import json as _json
+            err_detail = _json.dumps(result, ensure_ascii=False)[:500]
+            raise RuntimeError(f"CatPaw API error: {result.get('msg', 'unknown')}. Full response: {err_detail}")
         raw_data = result.get("data", result)
-        raw_content = raw_data.get("content", "")
+        raw_content = raw_data.get("content", "") or ""
         if not raw_content and raw_data.get("choices"):
-            raw_content = raw_data["choices"][0].get("message", {}).get("content", "")
+            raw_content = raw_data["choices"][0].get("message", {}).get("content", "") or ""
         print(f"[DEBUG] Raw model response: {raw_content[:500]}", file=sys.stderr)
+        catpaw_reasoning = raw_data.get("reasoning", "") or (raw_data.get("choices") and raw_data["choices"][0].get("message", {}).get("reasoning", "")) or ""
+        if catpaw_reasoning:
+            print(f"[DEBUG] Reasoning: {catpaw_reasoning[:300]}", file=sys.stderr)
 
-        openai_resp = self._to_openai_response(result, model)
+        openai_resp = self._to_openai_response(result, model, True)
         print(f"[DEBUG] Parsed tool_calls: {len(openai_resp['choices'][0]['message'].get('tool_calls', []))}", file=sys.stderr)
 
         # Start SSE response
@@ -358,12 +365,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             choice = choices[0]
             delta = choice.get("delta")
             if delta and isinstance(delta, dict):
-                content = delta.get("content", "")
-                reasoning = delta.get("reasoning", "") or delta.get("reasoning_content", "")
+                content = (delta.get("content") or "")
+                reasoning = (delta.get("reasoning") or delta.get("reasoning_content") or "")
             finish_reason = choice.get("finishReason") or choice.get("finish_reason")
 
         if not content and not finish_reason:
-            top_content = catpaw_data.get("content", "")
+            top_content = catpaw_data.get("content") or ""
             if top_content:
                 content = top_content
 
@@ -388,24 +395,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             }],
         }
 
-    def _to_openai_response(self, catpaw_resp: dict, model: str) -> dict:
+    def _to_openai_response(self, catpaw_resp: dict, model: str, has_tools: bool = False) -> dict:
         """Convert CatPaw response to standard OpenAI format."""
         data = catpaw_resp.get("data", catpaw_resp)
         choices = data.get("choices", [])
-        content = data.get("content", "")
-        reasoning = data.get("reasoning", "") or data.get("reasoning_content", "")
+        content = data.get("content", "") or ""
+        reasoning = (data.get("reasoning", "") or data.get("reasoning_content", "") or "")
         finish_reason = "stop"
 
         if choices:
             ch = choices[0]
             msg = ch.get("message", {})
             if not content:
-                content = msg.get("content", "")
+                content = msg.get("content", "") or ""
             if not reasoning:
-                reasoning = msg.get("reasoning", "") or msg.get("reasoning_content", "")
+                reasoning = (msg.get("reasoning", "") or msg.get("reasoning_content", "") or "")
             finish_reason = ch.get("finishReason") or ch.get("finish_reason") or "stop"
 
-        remaining_content, tool_calls = parse_tool_calls_from_content(content)
+        if has_tools:
+            remaining_content, tool_calls = parse_tool_calls_from_content(content)
+        else:
+            remaining_content = content
+            tool_calls = []
 
         message = {"role": "assistant", "content": remaining_content if remaining_content else None}
         if reasoning:
