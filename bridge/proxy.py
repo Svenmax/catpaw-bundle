@@ -488,7 +488,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             return
 
         messages = req_body.get("messages", [])
-        model = req_body.get("model", "glm-5.2")
+        model = req_body.get("model", "minimax-m2.7")
         stream = req_body.get("stream", False)
         tools = req_body.get("tools")
         tool_choice = req_body.get("tool_choice")
@@ -550,6 +550,12 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                   "presence_penalty", "response_format"]:
             if k in req_body:
                 api_body[k] = req_body[k]
+        # Default max_tokens for verbose output
+        if "max_tokens" not in api_body:
+            api_body["max_tokens"] = 16384
+        # Default temperature for more detailed output
+        if "temperature" not in api_body:
+            api_body["temperature"] = 0.85
 
         # ── Send request ─────────────────────────────────────────────
         try:

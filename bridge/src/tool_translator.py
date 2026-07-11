@@ -126,27 +126,19 @@ TOOL_PRIORITY = {
 def build_tool_system_prefix() -> str:
     """Build the tool-calling instruction prefix for system prompt."""
     return (
-        "You are an AI assistant with tool-calling capabilities. You MUST actively use tools to help the user.\n"
-        "When the user asks you to do something, DO NOT just describe what you would do - ACTUALLY CALL the tool.\n"
+        "You are an AI assistant with tool-calling capabilities.\n"
         "\n"
         "## Tool Call Format\n"
-        "Output tool calls using this EXACT format (no code blocks, no markdown):\n"
-        '<tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>\n'
+        'Output tool calls using <tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>\n'
         "\n"
-        "## Examples\n"
-        'User: check disk space\n'
-        '<tool_call>{"name":"bash","arguments":{"command":"df -h"}}</tool_call>\n'
-        'User: list files in /tmp\n'
-        '<tool_call>{"name":"bash","arguments":{"command":"ls -la /tmp"}}</tool_call>\n'
-        'User: read file /etc/hosts\n'
-        '<tool_call>{"name":"file_read","arguments":{"target_file":"/etc/hosts"}}</tool_call>\n'
-        "\n"
-        "## Rules\n"
-        "1. ALWAYS call a tool when the user asks you to DO something.\n"
+        "## Guidelines\n"
+        "1. When asked to DO something (list files, run commands, read data), use the appropriate tool.\n"
         "2. Use bash for system commands (df, du, ls, cat, ps, etc.)\n"
         "3. Use file_read/file_write/file_list for file operations.\n"
-        "4. After receiving tool results, analyze them and respond. Call more tools if needed.\n"
-        "5. Do NOT ask for permission to use tools. Just use them.\n"
+        "4. After receiving tool results, analyze them thoroughly and provide detailed explanations.\n"
+        "5. For code examples and explanations, write them inside code blocks (```python ... ```).\n"
+        "6. Do NOT use tools for code examples - tools are only for actual execution.\n"
+        "7. Always provide comprehensive, detailed responses with in-depth analysis.\n"
         "---\n"
     )
 
@@ -402,12 +394,21 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
     code_blocks = code_block_pattern.findall(content)
     if code_blocks:
         for block in code_blocks:
+            # Skip code blocks that look like Python code examples
+            stripped = block.strip()
+            if re.search(r'^(def |class |import |from |@|# |async def )', stripped, re.MULTILINE):
+                continue
             func_pattern = re.compile(r"(\w+)\s*\(\s*(.*?)\s*\)", re.DOTALL)
             func_matches = list(func_pattern.finditer(block))
 
             if func_matches:
                 for fm in func_matches:
                     name = fm.group(1)
+                    # Skip function definitions (def name(): / async def name():)
+                    line_start = block.rfind('\n', 0, fm.start()) + 1
+                    line_prefix = block[line_start:fm.start()].strip()
+                    if line_prefix in ('def', 'async def'):
+                        continue
                     args_str = fm.group(2).strip()
                     args = {}
                     if args_str:

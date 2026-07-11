@@ -12,28 +12,27 @@ catpaw:
   token_ttl: 240  # seconds
 
 models:
+  - minimax-m2.7
   - glm-5.2
   - glm-5.1
   - glm-5v-turbo
   - deepseek-v3.2
   - kimi-k2.6
   - kimi-k2.5
-  - minimax-m2.7
   - longcat-2.0
   - longcat-flash
 
 # Context management
 context:
-  max_total_tokens: 32000       # CatPaw API 的大致 token 限制
-  max_system_prompt: 3000      # 原始 system prompt 保留的最大字符数
-  max_tool_result: 3000        # 单个工具结果的最大字符数
-  max_tool_prompt: 4000        # 工具列表注入的最大字符数
-  # Summarization: compress older messages when exceeding token budget
+  max_total_tokens: 48000
+  max_system_prompt: 5000
+  max_tool_result: 8000
+  max_tool_prompt: 4000
   summarize:
-    enabled: true               # Enable conversation summarization
-    min_dropped: 3              # Min dropped messages before summarization kicks in
-    model: longcat-flash        # Cheap model for summarization
-    max_tokens: 500             # Max tokens for the summary response
+    enabled: false
+    min_dropped: 3
+    model: longcat-flash
+    max_tokens: 500
 
 # Tool filtering
 tools:
