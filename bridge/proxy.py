@@ -222,6 +222,15 @@ function startPolling() {
         pollTimer = null;
         document.getElementById('qr-status').textContent = '登录成功! Token: ' + data.token_prefix;
         document.getElementById('qr-status').className = 'status-bar success';
+                } else if (data.status === 'need_phone') {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        document.getElementById('qr-status').textContent = '扫码成功，请绑定手机号完成登录';
+        document.getElementById('qr-status').className = 'status-bar loading';
+        document.getElementById('qr-placeholder').innerHTML = '<div style="text-align:center; padding:40px 0"><p style="color:#52c41a; font-size:48px; margin-bottom:16px">&#10003;</p><p style="color:#333; font-size:16px">微信扫码成功</p></div>';
+        switchTab('phone');
+        document.getElementById('phone-status').textContent = '请绑定手机号完成登录';
+        document.getElementById('phone-status').className = 'status-bar loading';
       }
     })
     .catch(function() {});
@@ -306,6 +315,8 @@ function setPhoneStatus(msg, type) {
   el.textContent = msg;
   el.className = type ? 'status-bar ' + type : 'status-bar';
 }
+
+document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
 </script>
 </body>
 </html>"""
@@ -386,16 +397,29 @@ function setPhoneStatus(msg, type) {
             from src.oauth_login import QRCodeOAuthLogin
             try:
                 oauth = QRCodeOAuthLogin()
-                result = oauth.poll_access_token(code, timeout=1, interval=1)
-                self.token_manager.set_token_from_external(result.access_token, result.refresh_token)
-                self.token_manager.write_to_state_db(result.access_token, result.refresh_token)
-                self._send_json(200, {
-                    "status": "ok",
-                    "token_prefix": result.access_token[:20] + "...",
-                    "expires": result.expires,
-                })
-            except TimeoutError:
-                self._send_json(200, {"status": "polling"})
+                status = oauth.check_qrcode_status(code)
+                scanned = status.get("scanned", False)
+                mobile_bound = status.get("mobileBound")
+                access_token = status.get("accessToken")
+
+                print(f"[DEBUG] QR status: scanned={scanned}, mobileBound={mobile_bound}, hasToken={bool(access_token)}", file=sys.stderr)
+
+                if access_token:
+                    self.token_manager.set_token_from_external(access_token, status.get("refreshToken"))
+                    self.token_manager.write_to_state_db(access_token, status.get("refreshToken"))
+                    self._send_json(200, {
+                        "status": "ok",
+                        "token_prefix": access_token[:20] + "...",
+                        "expires": status.get("expires", 3600),
+                    })
+                elif scanned and mobile_bound is False:
+                    self._send_json(200, {
+                        "status": "need_phone",
+                        "scanned": True,
+                        "mobile_bound": False,
+                    })
+                else:
+                    self._send_json(200, {"status": "polling"})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
