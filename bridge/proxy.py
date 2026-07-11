@@ -64,6 +64,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, code: int, html: str):
+        body = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_sse_error(self, msg: str):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -76,8 +84,237 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── Routes ────────────────────────────────────────────────────────
 
+    LOGIN_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CatPaw Bridge - 登录</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+  .container { background: #fff; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,.08); padding: 40px; width: 400px; max-width: 94vw; }
+  h1 { text-align: center; font-size: 22px; color: #1a1a1a; margin-bottom: 8px; }
+  .subtitle { text-align: center; font-size: 13px; color: #888; margin-bottom: 28px; }
+  .tabs { display: flex; gap: 0; margin-bottom: 28px; background: #f0f0f0; border-radius: 10px; padding: 3px; }
+  .tab { flex: 1; text-align: center; padding: 10px 0; font-size: 14px; cursor: pointer; border-radius: 8px; transition: all .2s; color: #666; }
+  .tab.active { background: #fff; color: #1a1a1a; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .qr-img { display: block; width: 280px; height: 280px; margin: 0 auto 20px; border: 1px solid #eee; border-radius: 12px; }
+  .qr-placeholder { display: flex; align-items: center; justify-content: center; width: 280px; height: 280px; margin: 0 auto 20px; background: #fafafa; border: 1px dashed #ddd; border-radius: 12px; color: #999; font-size: 14px; }
+  .status-bar { text-align: center; font-size: 14px; color: #666; margin-top: 12px; min-height: 22px; }
+  .status-bar.loading { color: #1677ff; }
+  .status-bar.success { color: #52c41a; }
+  .status-bar.error { color: #ff4d4f; }
+  .btn { display: block; width: 100%; padding: 12px; border: none; border-radius: 10px; font-size: 15px; cursor: pointer; transition: all .2s; }
+  .btn-primary { background: #1677ff; color: #fff; }
+  .btn-primary:hover { background: #4096ff; }
+  .btn-primary:disabled { background: #a0c4ff; cursor: not-allowed; }
+  .btn-default { background: #f0f0f0; color: #333; }
+  .btn-default:hover { background: #e0e0e0; }
+  .form-group { margin-bottom: 16px; }
+  .form-group label { display: block; font-size: 13px; color: #555; margin-bottom: 6px; }
+  .form-group input { width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; outline: none; transition: border .2s; }
+  .form-group input:focus { border-color: #1677ff; }
+  .form-group .send-code-row { display: flex; gap: 10px; }
+  .form-group .send-code-row input { flex: 1; }
+  .form-group .send-code-btn { white-space: nowrap; padding: 10px 16px; background: #f0f0f0; border: 1px solid #ddd; border-radius: 8px; cursor: pointer; font-size: 13px; color: #555; transition: all .2s; }
+  .form-group .send-code-btn:hover { background: #e0e0e0; }
+  .form-group .send-code-btn:disabled { color: #bbb; cursor: not-allowed; }
+  .result-box { margin-top: 16px; padding: 12px 16px; border-radius: 10px; font-size: 13px; display: none; word-break: break-all; }
+  .result-box.success { display: block; background: #f6ffed; border: 1px solid #b7eb8f; color: #389e0d; }
+  .result-box.error { display: block; background: #fff2f0; border: 1px solid #ffccc7; color: #cf1322; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>CatPaw Bridge</h1>
+  <p class="subtitle">登录后即可通过 OpenAI 兼容接口使用 CatPaw 模型</p>
+
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('qrcode')">扫码登录</div>
+    <div class="tab" onclick="switchTab('phone')">手机号登录</div>
+  </div>
+
+  <div id="tab-qrcode" class="tab-content active">
+    <div id="qr-img-container">
+      <div class="qr-placeholder" id="qr-placeholder">正在获取二维码...</div>
+    </div>
+    <div id="qr-status" class="status-bar loading">等待扫码...</div>
+    <button class="btn btn-default" onclick="refreshQR()" style="margin-top:12px">刷新二维码</button>
+  </div>
+
+  <div id="tab-phone" class="tab-content">
+    <div class="form-group">
+      <label>手机号</label>
+      <input type="tel" id="phone-input" placeholder="请输入手机号" maxlength="11">
+    </div>
+    <div class="form-group">
+      <label>验证码</label>
+      <div class="send-code-row">
+        <input type="text" id="code-input" placeholder="请输入验证码" maxlength="6">
+        <button class="send-code-btn" id="send-code-btn" onclick="sendCode()">获取验证码</button>
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="phoneLogin()">登录</button>
+    <div id="phone-status" class="status-bar" style="margin-top:12px"></div>
+    <div id="phone-result" class="result-box"></div>
+  </div>
+</div>
+
+<script>
+let qrCode = null;
+let pollTimer = null;
+let countdownTimer = null;
+let countdown = 0;
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  if (name === 'qrcode') {
+    document.querySelectorAll('.tab')[0].classList.add('active');
+    document.getElementById('tab-qrcode').classList.add('active');
+    if (!qrCode) refreshQR();
+  } else {
+    document.querySelectorAll('.tab')[1].classList.add('active');
+    document.getElementById('tab-phone').classList.add('active');
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+}
+
+function refreshQR() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  document.getElementById('qr-placeholder').innerHTML = '正在获取二维码...';
+  document.getElementById('qr-placeholder').className = 'qr-placeholder';
+  document.getElementById('qr-status').textContent = '正在获取二维码...';
+  document.getElementById('qr-status').className = 'status-bar loading';
+
+  fetch('/login/qrcode')
+    .then(r => r.json())
+    .then(data => {
+      qrCode = data.code;
+      document.getElementById('qr-placeholder').innerHTML = '<img class="qr-img" src="' + data.qr_code_image_url + '" alt="QR Code">';
+      document.getElementById('qr-placeholder').className = '';
+      document.getElementById('qr-status').textContent = '请使用微信扫码登录';
+      document.getElementById('qr-status').className = 'status-bar loading';
+      startPolling();
+    })
+    .catch(e => {
+      document.getElementById('qr-placeholder').innerHTML = '获取二维码失败';
+      document.getElementById('qr-status').textContent = '获取二维码失败: ' + e.message;
+      document.getElementById('qr-status').className = 'status-bar error';
+    });
+}
+
+function startPolling() {
+  if (!qrCode) return;
+  pollTimer = setInterval(function() {
+    fetch('/login/poll', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code: qrCode})
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'ok') {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        document.getElementById('qr-status').textContent = '登录成功! Token: ' + data.token_prefix;
+        document.getElementById('qr-status').className = 'status-bar success';
+      }
+    })
+    .catch(function() {});
+  }, 2000);
+}
+
+function sendCode() {
+  var phone = document.getElementById('phone-input').value.trim();
+  if (!phone || phone.length < 11) { setPhoneStatus('请输入正确的手机号', 'error'); return; }
+  var btn = document.getElementById('send-code-btn');
+  btn.disabled = true;
+  setPhoneStatus('正在发送...', 'loading');
+  document.getElementById('phone-result').className = 'result-box';
+
+  fetch('/login/sendSms', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mobileNo: phone})
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.status === 'ok') {
+      setPhoneStatus('验证码已发送', 'success');
+      countdown = 60;
+      btn.textContent = countdown + 's';
+      if (countdownTimer) clearInterval(countdownTimer);
+      countdownTimer = setInterval(function() {
+        countdown--;
+        if (countdown <= 0) {
+          clearInterval(countdownTimer);
+          countdownTimer = null;
+          btn.textContent = '重新获取';
+          btn.disabled = false;
+        } else {
+          btn.textContent = countdown + 's';
+        }
+      }, 1000);
+    } else {
+      btn.disabled = false;
+      setPhoneStatus(data.error || '发送失败', 'error');
+    }
+  })
+  .catch(function(e) {
+    btn.disabled = false;
+    setPhoneStatus('请求失败: ' + e.message, 'error');
+  });
+}
+
+function phoneLogin() {
+  var phone = document.getElementById('phone-input').value.trim();
+  var code = document.getElementById('code-input').value.trim();
+  if (!phone || !code) { setPhoneStatus('请填写手机号和验证码', 'error'); return; }
+  setPhoneStatus('正在登录...', 'loading');
+  document.getElementById('phone-result').className = 'result-box';
+
+  fetch('/login/loginByPhone', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mobileNo: phone, verificationCode: code})
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.status === 'ok') {
+      var box = document.getElementById('phone-result');
+      box.className = 'result-box success';
+      box.innerHTML = '登录成功! Token: ' + data.token_prefix + '<br>有效期: ' + data.expires + 's';
+      setPhoneStatus('', '');
+    } else {
+      var box = document.getElementById('phone-result');
+      box.className = 'result-box error';
+      box.textContent = data.error || '登录失败';
+      setPhoneStatus('', '');
+    }
+  })
+  .catch(function(e) {
+    setPhoneStatus('请求失败: ' + e.message, 'error');
+  });
+}
+
+function setPhoneStatus(msg, type) {
+  var el = document.getElementById('phone-status');
+  el.textContent = msg;
+  el.className = type ? 'status-bar ' + type : 'status-bar';
+}
+</script>
+</body>
+</html>"""
+
     def do_GET(self):
-        if self.path == "/v1/models":
+        if self.path == "/" or self.path == "":
+            self._send_html(200, self.LOGIN_PAGE_HTML)
+
+        elif self.path == "/v1/models":
             models = [
                 {"id": m, "object": "model", "created": 1700000000, "owned_by": "catpaw"}
                 for m in self.config.models
@@ -159,6 +396,59 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 })
             except TimeoutError:
                 self._send_json(200, {"status": "polling"})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+
+        if self.path == "/login/sendSms":
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len)
+            try:
+                req_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+
+            mobile_no = req_body.get("mobileNo") or req_body.get("mobile_no")
+            if not mobile_no:
+                self._send_json(400, {"error": "mobileNo is required"})
+                return
+
+            from src.oauth_login import PhoneOAuthLogin
+            try:
+                phone_oauth = PhoneOAuthLogin()
+                request_code = phone_oauth.send_code(mobile_no)
+                self._send_json(200, {"status": "ok", "request_code": request_code})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+
+        if self.path == "/login/loginByPhone":
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len)
+            try:
+                req_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+
+            mobile_no = req_body.get("mobileNo") or req_body.get("mobile_no")
+            verification_code = req_body.get("verificationCode") or req_body.get("verification_code") or req_body.get("code")
+            if not mobile_no or not verification_code:
+                self._send_json(400, {"error": "mobileNo and verificationCode are required"})
+                return
+
+            from src.oauth_login import PhoneOAuthLogin
+            try:
+                phone_oauth = PhoneOAuthLogin()
+                result = phone_oauth.login(mobile_no, verification_code)
+                self.token_manager.set_token_from_external(result.access_token, result.refresh_token)
+                self.token_manager.write_to_state_db(result.access_token, result.refresh_token)
+                self._send_json(200, {
+                    "status": "ok",
+                    "token_prefix": result.access_token[:20] + "...",
+                    "expires": result.expires,
+                })
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
@@ -598,10 +888,10 @@ def main():
 
     server = HTTPServer((config.server.host, config.server.port), ProxyHandler)
     print(f"[INFO] Proxy ready at http://{config.server.host}:{config.server.port}", file=sys.stderr)
+    print(f"[INFO]    Login:   http://{config.server.host}:{config.server.port}/", file=sys.stderr)
     print(f"[INFO]    Models:  http://{config.server.host}:{config.server.port}/v1/models", file=sys.stderr)
     print(f"[INFO]    Chat:    http://{config.server.host}:{config.server.port}/v1/chat/completions", file=sys.stderr)
     print(f"[INFO]    Health:  http://{config.server.host}:{config.server.port}/health", file=sys.stderr)
-    print(f"[INFO]    Login:   http://{config.server.host}:{config.server.port}/login/qrcode", file=sys.stderr)
     print(f"[INFO]    Token:   http://{config.server.host}:{config.server.port}/token (POST)", file=sys.stderr)
 
     try:
