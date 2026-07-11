@@ -83,14 +83,11 @@ class QRCodeOAuthLogin(_BaseLogin):
 
     def check_qrcode_status(self, code: str) -> dict:
         """Check QR code scan status and return raw API response data."""
-        import sys
         body = json.dumps({"code": code}).encode()
         data = self._request("POST", "/api/login/accessToken", body)
         if data.get("code") != 0:
             raise RuntimeError(f"Access token poll failed: {data.get('msg', 'unknown')}")
-        result = data["data"]
-        print(f"[DEBUG] QR full data: {json.dumps(result, ensure_ascii=False)[:500]}", file=sys.stderr)
-        return result
+        return data["data"]
         """Poll access token endpoint until user scans QR code."""
         import sys
         body = json.dumps({"code": code}).encode()
@@ -99,9 +96,7 @@ class QRCodeOAuthLogin(_BaseLogin):
             data = self._request("POST", "/api/login/accessToken", body)
             result = data.get("data", {})
             scanned = result.get("scanned", False)
-            mobile_bound = result.get("mobileBound")
             has_token = "accessToken" in result
-            print(f"[DEBUG] poll: scanned={scanned}, mobileBound={mobile_bound}, hasToken={has_token}, sessValid=code={data.get('code')}", file=sys.stderr)
             if data.get("code") != 0:
                 raise RuntimeError(f"Access token poll failed: {data.get('msg', 'unknown')}")
             if scanned and result.get("accessToken"):

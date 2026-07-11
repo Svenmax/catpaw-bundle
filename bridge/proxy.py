@@ -402,8 +402,6 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 mobile_bound = status.get("mobileBound")
                 access_token = status.get("accessToken")
 
-                print(f"[DEBUG] QR status: scanned={scanned}, mobileBound={mobile_bound}, hasToken={bool(access_token)}", file=sys.stderr)
-
                 if access_token:
                     self.token_manager.set_token_from_external(access_token, status.get("refreshToken"))
                     self.token_manager.write_to_state_db(access_token, status.get("refreshToken"))
@@ -762,13 +760,13 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                     delta_content = delta.get("content", "")
                     if delta_content == "[DONE]":
                         continue
-                    catpaw_reasoning = delta.pop("reasoning", None)
-                    if catpaw_reasoning:
+                    reasoning_content = delta.pop("reasoning_content", None)
+                    if reasoning_content:
                         reason_chunk = copy.deepcopy(openai_chunk)
-                        reason_chunk["choices"][0]["delta"] = {"reasoning": catpaw_reasoning}
+                        reason_chunk["choices"][0]["delta"] = {"reasoning_content": reasoning_content}
                         self.wfile.write(f"data: {json.dumps(reason_chunk, ensure_ascii=False)}\n\n".encode())
                         self.wfile.flush()
-                    if delta.get("content") is not None:
+                    if delta:
                         self.wfile.write(f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n".encode())
                         self.wfile.flush()
 
@@ -796,13 +794,25 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             delta = choice.get("delta")
             if delta and isinstance(delta, dict):
                 content = (delta.get("content") or "")
-                reasoning = (delta.get("reasoning") or delta.get("reasoning_content") or "")
+                reasoning = (delta.get("reasoning") or delta.get("reasoning_content") or delta.get("reasoningContent") or "")
+                if not reasoning and delta.get("reasoningDetails"):
+                    rd = delta["reasoningDetails"]
+                    if isinstance(rd, list) and len(rd) > 0:
+                        reasoning = rd[0].get("text") or rd[0].get("thinking") or ""
             finish_reason = choice.get("finishReason") or choice.get("finish_reason")
 
         if not content and not finish_reason:
             top_content = catpaw_data.get("content") or ""
             if top_content:
                 content = top_content
+
+        if not content and not reasoning:
+            top_reasoning = (catpaw_data.get("reasoning") or catpaw_data.get("reasoning_content") or catpaw_data.get("reasoningContent") or "")
+            if not top_reasoning and catpaw_data.get("reasoningDetails"):
+                rd = catpaw_data["reasoningDetails"]
+                if isinstance(rd, list) and len(rd) > 0:
+                    top_reasoning = rd[0].get("text") or rd[0].get("thinking") or ""
+            reasoning = reasoning or top_reasoning
 
         if not content and not reasoning and not finish_reason:
             return None
@@ -811,7 +821,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         if content:
             delta["content"] = content
         if reasoning:
-            delta["reasoning"] = reasoning
+            delta["reasoning_content"] = reasoning
 
         return {
             "id": catpaw_data.get("id", f"chatcmpl-{uuid.uuid4().hex[:12]}"),
@@ -830,7 +840,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         data = catpaw_resp.get("data", catpaw_resp)
         choices = data.get("choices", [])
         content = data.get("content", "") or ""
-        reasoning = (data.get("reasoning", "") or data.get("reasoning_content", "") or "")
+        reasoning = (data.get("reasoning", "") or data.get("reasoning_content", "") or data.get("reasoningContent", "") or "")
         finish_reason = "stop"
 
         if choices:
@@ -839,7 +849,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             if not content:
                 content = msg.get("content", "") or ""
             if not reasoning:
-                reasoning = (msg.get("reasoning", "") or msg.get("reasoning_content", "") or "")
+                reasoning = (msg.get("reasoning", "") or msg.get("reasoning_content", "") or msg.get("reasoningContent", "") or "")
             finish_reason = ch.get("finishReason") or ch.get("finish_reason") or "stop"
 
         if has_tools:
