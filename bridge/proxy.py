@@ -25,6 +25,7 @@ import sys
 import time
 import uuid
 import argparse
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Dict, Optional
 
@@ -453,9 +454,10 @@ def main():
 
     token = token_manager.get_token()
     if token:
-        print(f"[INFO] ✅ CatPaw token found: {token[:20]}...", file=sys.stderr)
+        print(f"[INFO] CatPaw token found: {token[:20]}...", file=sys.stderr)
+        _start_heartbeat(token_manager)
     else:
-        print("[WARN] ⚠️  CatPaw token not found. Make sure CatPaw IDE is logged in.", file=sys.stderr)
+        print("[WARN] CatPaw token not found. Make sure CatPaw IDE is logged in.", file=sys.stderr)
 
     # Set class-level config on handler
     ProxyHandler.config = config
@@ -473,6 +475,25 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down...", file=sys.stderr)
         server.shutdown()
+
+
+def _start_heartbeat(token_manager: TokenManager, interval: int = 3300):
+    """Periodically refresh token from CatPaw server (every 55 minutes)."""
+    def _heartbeat():
+        while True:
+            time.sleep(interval)
+            try:
+                token = token_manager.refresh_from_server()
+                if token:
+                    print(f"[HEARTBEAT] Token refreshed: {token[:20]}...", file=sys.stderr)
+                else:
+                    print("[HEARTBEAT] Token refresh failed, will retry", file=sys.stderr)
+            except Exception as e:
+                print(f"[HEARTBEAT] Error: {e}", file=sys.stderr)
+
+    t = threading.Thread(target=_heartbeat, daemon=True)
+    t.start()
+    print(f"[INFO] Token heartbeat started (interval: {interval}s = {interval//60}min)", file=sys.stderr)
 
 
 if __name__ == "__main__":

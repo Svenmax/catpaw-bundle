@@ -1,11 +1,13 @@
 """Token management - reads SSO access token from CatPaw IDE's local database."""
 
+import http.client
 import json
 import os
 import sqlite3
+import ssl
 import sys
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class TokenManager:
@@ -59,8 +61,95 @@ class TokenManager:
             return self._cache["value"]
         return self.refresh_token()
 
+    def _read_refresh_token_and_access(self, cur) -> Tuple[Optional[str], Optional[str]]:
+        """Read refreshToken and accessToken from auth extension keychain storage."""
+        cur.execute("SELECT value FROM ItemTable WHERE key = 'catpaw.mt-authentication'")
+        row = cur.fetchone()
+        if not row:
+            return None, None
+
+        data = json.loads(row[0])
+        mt_auth = json.loads(data.get("mt.auth", "{}"))
+        refresh_token = mt_auth.get("refreshToken")
+        sessions = mt_auth.get("sessions", [])
+        access_token = sessions[0].get("accessToken") if sessions else None
+        return refresh_token, access_token
+
+    def _call_refresh_api(self, access_token: str, refresh_token: str) -> Optional[dict]:
+        """Call CatPaw refreshToken API to get new access token."""
+        tenant = os.environ.get("CATPAW_TENANT", "5282fa6645")
+        body = json.dumps({"refreshToken": refresh_token})
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        conn = http.client.HTTPSConnection("catpaw.meituan.com", context=ctx)
+        conn.request(
+            "POST",
+            "/api/login/refreshToken",
+            body,
+            {
+                "Content-Type": "application/json",
+                "Catpaw-Auth": access_token,
+                "tenant": tenant,
+            },
+        )
+        resp = conn.getresponse()
+        resp_body = resp.read().decode("utf-8")
+        conn.close()
+
+        if resp.status != 200:
+            print(f"[ERROR] refreshToken API returned HTTP {resp.status}: {resp_body[:500]}", file=sys.stderr)
+            return None
+
+        result = json.loads(resp_body)
+        if result.get("code") != 0:
+            print(f"[ERROR] refreshToken API error: code={result.get('code')} msg={result.get('msg', '')}", file=sys.stderr)
+            return None
+
+        data = result.get("data", result)
+        print(f"[INFO] Token refreshed: expires={data.get('expires')}, refreshExpires={data.get('refreshExpires')}", file=sys.stderr)
+        return data
+
+    def refresh_from_server(self) -> Optional[str]:
+        """Try to refresh access token by calling CatPaw refreshToken API."""
+        try:
+            conn = sqlite3.connect(self.state_db)
+            cur = conn.cursor()
+            refresh_token, access_token = self._read_refresh_token_and_access(cur)
+            conn.close()
+
+            if not refresh_token or not access_token:
+                print("[ERROR] No refresh token or access token in keychain", file=sys.stderr)
+                return None
+
+            result = self._call_refresh_api(access_token, refresh_token)
+            if not result:
+                return None
+
+            new_access_token = result.get("accessToken") or result.get("access_token")
+            new_refresh_token = result.get("refreshToken") or result.get("refresh_token")
+
+            if not new_access_token:
+                print("[ERROR] refreshToken API returned no new access token", file=sys.stderr)
+                return None
+
+            self._cache["value"] = new_access_token
+            self._cache["ts"] = time.time()
+            self._cache["refreshed_from_server"] = True
+
+            if new_refresh_token:
+                print(f"[INFO] Server returned new refreshToken as well", file=sys.stderr)
+
+            return new_access_token
+
+        except Exception as e:
+            print(f"[ERROR] Server refresh failed: {e}", file=sys.stderr)
+            return None
+
     def refresh_token(self) -> Optional[str]:
-        """Force refresh token from DB, bypassing cache."""
+        """Force refresh token from DB, bypassing cache. Falls back to server refresh."""
         now = time.time()
 
         try:
@@ -69,17 +158,18 @@ class TokenManager:
             token = self._read_plugin_auth(cur) or self._read_auth_provider_token(cur)
             conn.close()
 
-            if not token:
-                print("[ERROR] No CatPaw access token found in state.vscdb", file=sys.stderr)
-                return None
+            if token:
+                self._cache["value"] = token
+                self._cache["ts"] = now
+                return token
 
-            self._cache["value"] = token
-            self._cache["ts"] = now
-            return token
+            print("[INFO] DB token not found or expired, trying server-side refresh...", file=sys.stderr)
+            return self.refresh_from_server()
 
         except Exception as e:
-            print(f"[ERROR] Failed to read token: {e}", file=sys.stderr)
-            return None
+            print(f"[ERROR] Failed to read token from DB: {e}", file=sys.stderr)
+            print("[INFO] Trying server-side refresh...", file=sys.stderr)
+            return self.refresh_from_server()
 
     def build_headers(self, token: str, encrypted_key: str = None) -> dict:
         """Build request headers for CatPaw API."""
