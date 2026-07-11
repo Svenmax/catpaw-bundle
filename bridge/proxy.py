@@ -18,6 +18,7 @@ Usage:
   python proxy.py [--config config.yaml]
 """
 
+import copy
 import json
 import os
 import re
@@ -91,6 +92,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "models": self.config.models,
             })
 
+        elif self.path == "/login/qrcode":
+            from src.oauth_login import QRCodeOAuthLogin
+            try:
+                oauth = QRCodeOAuthLogin()
+                qr = oauth.get_qrcode()
+                self._send_json(200, {
+                    "code": qr["code"],
+                    "qr_code_image_url": qr["qrCodeImageUrl"],
+                    "expire_time": qr["expireTime"],
+                })
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -116,6 +130,37 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "token_prefix": access_token[:20] + "...",
             })
+            return
+
+        if self.path == "/login/poll":
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len)
+            try:
+                req_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+
+            code = req_body.get("code")
+            if not code:
+                self._send_json(400, {"error": "code is required"})
+                return
+
+            from src.oauth_login import QRCodeOAuthLogin
+            try:
+                oauth = QRCodeOAuthLogin()
+                result = oauth.poll_access_token(code, timeout=1, interval=1)
+                self.token_manager.set_token_from_external(result.access_token, result.refresh_token)
+                self.token_manager.write_to_state_db(result.access_token, result.refresh_token)
+                self._send_json(200, {
+                    "status": "ok",
+                    "token_prefix": result.access_token[:20] + "...",
+                    "expires": result.expires,
+                })
+            except TimeoutError:
+                self._send_json(200, {"status": "polling"})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
             return
 
         if self.path != "/v1/chat/completions":
@@ -399,11 +444,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                 openai_chunk = self._convert_stream_chunk(data, model)
                 if openai_chunk:
-                    delta_content = openai_chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                    delta = openai_chunk["choices"][0]["delta"]
+                    delta_content = delta.get("content", "")
                     if delta_content == "[DONE]":
                         continue
-                    self.wfile.write(f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                    catpaw_reasoning = delta.pop("reasoning", None)
+                    if catpaw_reasoning:
+                        reason_chunk = copy.deepcopy(openai_chunk)
+                        reason_chunk["choices"][0]["delta"] = {"reasoning": catpaw_reasoning}
+                        self.wfile.write(f"data: {json.dumps(reason_chunk, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                    if delta.get("content") is not None:
+                        self.wfile.write(f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
 
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -501,6 +554,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="CatPaw Bridge - OpenAI-compatible Proxy")
     parser.add_argument("--config", "-c", help="Path to config.yaml", default=None)
+    parser.add_argument("--login", action="store_true", help="Start OAuth login flow and exit")
+    parser.add_argument("--no-oauth", action="store_true", help="Skip OAuth login, fail if no token")
     args = parser.parse_args()
 
     # Load configuration
@@ -514,12 +569,27 @@ def main():
     token_manager = TokenManager(config.catpaw.state_db, config.catpaw.token_ttl)
     catpaw_client = CatPawClient(config.catpaw.api_host, config.catpaw.api_path, token_manager)
 
+    if args.login:
+        token = token_manager.login_oauth()
+        if token:
+            print(f"[INFO] Login successful: {token[:20]}...", file=sys.stderr)
+        return
+
     token = token_manager.get_token()
     if token:
         print(f"[INFO] CatPaw token found: {token[:20]}...", file=sys.stderr)
         _start_heartbeat(token_manager)
-    else:
+    elif args.no_oauth:
         print("[WARN] CatPaw token not found. Make sure CatPaw IDE is logged in.", file=sys.stderr)
+    else:
+        print("[INFO] No token found, starting OAuth login...", file=sys.stderr)
+        try:
+            token = token_manager.login_oauth(timeout=300)
+            if token:
+                _start_heartbeat(token_manager)
+        except Exception as e:
+            print(f"[ERROR] OAuth login failed: {e}", file=sys.stderr)
+            print("[WARN] Starting without token. Use --login to retry or POST /token to inject.", file=sys.stderr)
 
     # Set class-level config on handler
     ProxyHandler.config = config
@@ -527,10 +597,12 @@ def main():
     ProxyHandler.catpaw_client = catpaw_client
 
     server = HTTPServer((config.server.host, config.server.port), ProxyHandler)
-    print(f"[INFO] 🚀 Proxy ready at http://{config.server.host}:{config.server.port}/v1", file=sys.stderr)
+    print(f"[INFO] Proxy ready at http://{config.server.host}:{config.server.port}", file=sys.stderr)
     print(f"[INFO]    Models:  http://{config.server.host}:{config.server.port}/v1/models", file=sys.stderr)
     print(f"[INFO]    Chat:    http://{config.server.host}:{config.server.port}/v1/chat/completions", file=sys.stderr)
     print(f"[INFO]    Health:  http://{config.server.host}:{config.server.port}/health", file=sys.stderr)
+    print(f"[INFO]    Login:   http://{config.server.host}:{config.server.port}/login/qrcode", file=sys.stderr)
+    print(f"[INFO]    Token:   http://{config.server.host}:{config.server.port}/token (POST)", file=sys.stderr)
 
     try:
         server.serve_forever()

@@ -7,6 +7,7 @@ server:
 catpaw:
   api_host: catpaw.meituan.com
   api_path: /api/gpt/chat/completions
+  login_server: https://catpaw.meituan.com  # used for OAuth login
   state_db: "/root/.config/CatPawAI/User/globalStorage/state.vscdb"
   token_ttl: 240  # seconds
 

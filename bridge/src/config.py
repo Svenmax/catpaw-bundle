@@ -17,6 +17,7 @@ class ServerConfig:
 class CatPawConfig:
     api_host: str = "catpaw.meituan.com"
     api_path: str = "/api/gpt/chat/completions"
+    login_server: str = "https://catpaw.meituan.com"
     state_db: str = "~/Library/Application Support/CatPawAI/User/globalStorage/state.vscdb"
     token_ttl: int = 240
 

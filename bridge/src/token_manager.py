@@ -7,6 +7,7 @@ import sqlite3
 import ssl
 import sys
 import time
+import threading
 from typing import Optional, Tuple
 
 
@@ -236,6 +237,74 @@ class TokenManager:
             print(f"[ERROR] Failed to read token from DB: {e}", file=sys.stderr)
             print("[INFO] Trying server-side refresh...", file=sys.stderr)
             return self.refresh_from_server()
+
+    def write_to_state_db(self, access_token: str, refresh_token: str = ""):
+        """Write token directly to state.vscdb so Bridge reads it on next restart."""
+        try:
+            conn = sqlite3.connect(self.state_db)
+            cur = conn.cursor()
+
+            data = json.dumps({
+                "sessions": [{
+                    "id": "bridge-oauth",
+                    "accessToken": access_token,
+                    "account": {"label": "oauth", "id": "oauth", "userInfoId": ""},
+                    "scopes": ["sankuai"],
+                }],
+                "refreshToken": refresh_token,
+            })
+
+            cur.execute(
+                "SELECT value FROM ItemTable WHERE key = 'catpaw.mt-authentication'"
+            )
+            row = cur.fetchone()
+            if row:
+                existing = json.loads(row[0])
+                existing["mt.auth"] = data
+                cur.execute(
+                    "UPDATE ItemTable SET value = ? WHERE key = 'catpaw.mt-authentication'",
+                    (json.dumps(existing),),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                    ("catpaw.mt-authentication", json.dumps({"mt.auth": data})),
+                )
+
+            conn.commit()
+            conn.close()
+            print(f"[INFO] Token written to state.vscdb: {access_token[:20]}...", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Failed to write token to state.vscdb: {e}", file=sys.stderr)
+
+    def login_oauth(self, interactive: bool = True, timeout: int = 300) -> Optional[str]:
+        """Perform QR Code OAuth login, get tokens, store them."""
+        from .oauth_login import QRCodeOAuthLogin
+
+        oauth = QRCodeOAuthLogin()
+        if interactive:
+            result = oauth.login_interactive(timeout)
+        else:
+            qr = oauth.get_qrcode()
+            print(f"[LOGIN] QR Code URL: {qr['qrCodeImageUrl']}", file=sys.stderr)
+            print(f"[LOGIN] Waiting for scan (timeout: {timeout}s)...", file=sys.stderr)
+            result = oauth.poll_access_token(qr["code"], timeout)
+
+        self._cache["value"] = result.access_token
+        self._cache["ts"] = time.time()
+        self._write_cache_file(result.access_token, result.refresh_token, result.expires)
+        self.write_to_state_db(result.access_token, result.refresh_token)
+
+        print(f"[INFO] OAuth login successful: {result.access_token[:20]}...", file=sys.stderr)
+        return result.access_token
+
+    def get_token_with_oauth(self, interactive: bool = True, timeout: int = 300) -> Optional[str]:
+        """Get token with automatic OAuth fallback when no token is available."""
+        token = self.get_token()
+        if token:
+            return token
+        print("[INFO] No token found, starting OAuth login...", file=sys.stderr)
+        return self.login_oauth(interactive, timeout)
 
     def build_headers(self, token: str, encrypted_key: str = None) -> dict:
         """Build request headers for CatPaw API."""
