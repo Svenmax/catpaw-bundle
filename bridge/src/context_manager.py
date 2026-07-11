@@ -10,7 +10,7 @@ Instead of blindly truncating old messages, this module:
 
 import sys
 import json
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Callable
 from .token_counter import count_tokens, count_message_tokens, count_messages_tokens, truncate_to_tokens
 
 
@@ -54,6 +54,7 @@ def truncate_conversation_history(
     max_total_tokens: int = 8000,
     max_system_chars: int = 3000,
     max_tool_result_chars: int = 3000,
+    summarizer: Optional[Callable[[List[Dict[str, Any]]], Optional[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Truncate conversation history to fit within token budget.
@@ -66,6 +67,10 @@ def truncate_conversation_history(
     Drops:
     - Oldest conversation messages first
     - Redundant tool results (summarized instead)
+
+    If summarizer is provided and 3+ messages are dropped, calls it to get
+    a summary of the dropped content and injects it as a system message.
+    Falls back to truncation notice if summarizer returns None.
     """
     total_tokens = count_messages_tokens(messages)
 
@@ -141,14 +146,33 @@ def truncate_conversation_history(
     kept_conv.reverse()
 
     if len(kept_conv) < len(conv_msgs):
-        dropped = len(conv_msgs) - len(kept_conv)
-        print(f"[DEBUG] History truncated: dropped {dropped} oldest messages, "
+        dropped_count = len(conv_msgs) - len(kept_conv)
+        dropped_msgs = conv_msgs[:dropped_count]
+        print(f"[DEBUG] History truncated: dropped {dropped_count} oldest messages, "
               f"{total_tokens} -> {system_tokens + current_tokens} tokens", file=sys.stderr)
 
-        # Add truncation notice
-        if kept_conv:
-            first = kept_conv[0]
-            if first.get("role") == "user" and isinstance(first.get("content"), str):
-                first["content"] = f"[Earlier {dropped} messages truncated]\n" + first["content"]
+        # Try summarization if callback provided and enough messages to justify
+        summary = None
+        if summarizer and dropped_count >= 3:
+            try:
+                print(f"[INFO] Summarizing {dropped_count} dropped messages...", file=sys.stderr)
+                summary = summarizer(dropped_msgs)
+                if summary:
+                    print(f"[INFO] Summary generated ({len(summary)} chars)", file=sys.stderr)
+            except Exception as e:
+                print(f"[WARN] Summarization failed: {e}", file=sys.stderr)
+
+        if summary:
+            summary_msg = {
+                "role": "system",
+                "content": f"[Earlier conversation summary]: {summary}"
+            }
+            kept_conv.insert(0, summary_msg)
+        else:
+            # Fall back to simple truncation notice
+            if kept_conv:
+                first = kept_conv[0]
+                if first.get("role") == "user" and isinstance(first.get("content"), str):
+                    first["content"] = f"[Earlier {dropped_count} messages truncated]\n" + first["content"]
 
     return system_msgs + kept_conv

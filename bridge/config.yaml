@@ -27,6 +27,12 @@ context:
   max_system_prompt: 3000      # 原始 system prompt 保留的最大字符数
   max_tool_result: 3000        # 单个工具结果的最大字符数
   max_tool_prompt: 4000        # 工具列表注入的最大字符数
+  # Summarization: compress older messages when exceeding token budget
+  summarize:
+    enabled: true               # Enable conversation summarization
+    min_dropped: 3              # Min dropped messages before summarization kicks in
+    model: longcat-flash        # Cheap model for summarization
+    max_tokens: 500             # Max tokens for the summary response
 
 # Tool filtering
 tools:

@@ -13,10 +13,50 @@ from typing import Optional, Tuple
 class TokenManager:
     """Manages CatPaw SSO access token with caching."""
 
+    CACHE_FILE = "/tmp/catpaw-bridge-token.json"
+
     def __init__(self, state_db_path: str, ttl: int = 240):
         self.state_db = os.path.expanduser(state_db_path)
         self.ttl = ttl
         self._cache: dict = {"value": None, "ts": 0, "user_info": {}}
+
+    def _read_cache_file(self) -> Optional[dict]:
+        """Read token from persistent cache file."""
+        try:
+            if os.path.exists(self.CACHE_FILE):
+                with open(self.CACHE_FILE, "r") as f:
+                    data = json.load(f)
+                ts = data.get("ts", 0)
+                if time.time() - ts < data.get("ttl", 3600):
+                    return data
+                os.remove(self.CACHE_FILE)
+        except Exception as e:
+            print(f"[WARN] Cache file read failed: {e}", file=sys.stderr)
+        return None
+
+    def _write_cache_file(self, token: str, refresh_token: str = None, ttl: int = 3600):
+        """Write token to persistent cache file."""
+        try:
+            data = {
+                "accessToken": token,
+                "ts": time.time(),
+                "ttl": ttl,
+            }
+            if refresh_token:
+                data["refreshToken"] = refresh_token
+            with open(self.CACHE_FILE, "w") as f:
+                json.dump(data, f)
+            os.chmod(self.CACHE_FILE, 0o600)
+        except Exception as e:
+            print(f"[WARN] Cache file write failed: {e}", file=sys.stderr)
+
+    def set_token_from_external(self, token: str, refresh_token: str = None) -> bool:
+        """Accept token from external source (e.g. Bridge /token endpoint)."""
+        self._cache["value"] = token
+        self._cache["ts"] = time.time()
+        self._write_cache_file(token, refresh_token)
+        print(f"[INFO] Token set from external source: {token[:20]}...", file=sys.stderr)
+        return True
 
     def _read_plugin_auth(self, cur) -> Optional[str]:
         """Read the auth token CatPaw's IDEKit plugin uses for API calls."""
@@ -55,10 +95,19 @@ class TokenManager:
         return sessions[0].get("accessToken")
 
     def get_token(self) -> Optional[str]:
-        """Get current SSO token, refreshing from DB if cache expired."""
+        """Get current SSO token: cache file → memory → DB → server refresh."""
         now = time.time()
         if self._cache["value"] and now - self._cache["ts"] < self.ttl:
             return self._cache["value"]
+
+        # Try persistent cache file
+        cached = self._read_cache_file()
+        if cached and cached.get("accessToken"):
+            self._cache["value"] = cached["accessToken"]
+            self._cache["ts"] = cached.get("ts", 0)
+            print(f"[INFO] Token loaded from cache file: {cached['accessToken'][:20]}...", file=sys.stderr)
+            return cached["accessToken"]
+
         return self.refresh_token()
 
     def _read_refresh_token_and_access(self, cur) -> Tuple[Optional[str], Optional[str]]:
@@ -139,6 +188,8 @@ class TokenManager:
             self._cache["ts"] = time.time()
             self._cache["refreshed_from_server"] = True
 
+            self._write_cache_file(new_access_token, new_refresh_token)
+
             if new_refresh_token:
                 print(f"[INFO] Server returned new refreshToken as well", file=sys.stderr)
 
@@ -149,7 +200,7 @@ class TokenManager:
             return None
 
     def refresh_token(self) -> Optional[str]:
-        """Force refresh token from DB, bypassing cache. Falls back to server refresh."""
+        """Force refresh token: DB → cache file → server refresh."""
         now = time.time()
 
         try:
@@ -161,9 +212,24 @@ class TokenManager:
             if token:
                 self._cache["value"] = token
                 self._cache["ts"] = now
+                self._write_cache_file(token)
                 return token
 
-            print("[INFO] DB token not found or expired, trying server-side refresh...", file=sys.stderr)
+            # Try cache file for refreshToken
+            cached = self._read_cache_file()
+            if cached and cached.get("refreshToken") and cached.get("accessToken"):
+                print("[INFO] DB token not found, trying refresh with cached refreshToken...", file=sys.stderr)
+                result = self._call_refresh_api(cached["accessToken"], cached["refreshToken"])
+                if result:
+                    new_token = result.get("accessToken") or result.get("access_token")
+                    new_rt = result.get("refreshToken") or result.get("refresh_token")
+                    if new_token:
+                        self._cache["value"] = new_token
+                        self._cache["ts"] = time.time()
+                        self._write_cache_file(new_token, new_rt)
+                        return new_token
+
+            print("[INFO] DB token not found, trying server-side refresh...", file=sys.stderr)
             return self.refresh_from_server()
 
         except Exception as e:

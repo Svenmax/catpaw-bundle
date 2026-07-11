@@ -22,11 +22,20 @@ class CatPawConfig:
 
 
 @dataclass
+class SummarizeConfig:
+    enabled: bool = True
+    min_dropped: int = 3
+    model: str = "longcat-flash"
+    max_tokens: int = 500
+
+
+@dataclass
 class ContextConfig:
     max_total_tokens: int = 8000
     max_system_prompt: int = 3000
     max_tool_result: int = 3000
     max_tool_prompt: int = 4000
+    summarize: SummarizeConfig = field(default_factory=SummarizeConfig)
 
 
 @dataclass
@@ -85,7 +94,12 @@ class Config:
             if "models" in data:
                 config.models = data["models"]
             if "context" in data:
-                config.context = ContextConfig(**data["context"])
+                ctx = data["context"]
+                summarize_data = ctx.pop("summarize", {})
+                config.context = ContextConfig(
+                    **ctx,
+                    summarize=SummarizeConfig(**summarize_data) if summarize_data else SummarizeConfig(),
+                )
             if "tools" in data:
                 t = data["tools"]
                 config.tools = ToolsConfig(

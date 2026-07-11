@@ -95,6 +95,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/token":
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len)
+            try:
+                req_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+
+            access_token = req_body.get("accessToken") or req_body.get("access_token")
+            refresh_token = req_body.get("refreshToken") or req_body.get("refresh_token")
+
+            if not access_token:
+                self._send_json(400, {"error": "accessToken is required"})
+                return
+
+            self.token_manager.set_token_from_external(access_token, refresh_token)
+            self._send_json(200, {
+                "status": "ok",
+                "token_prefix": access_token[:20] + "...",
+            })
+            return
+
         if self.path != "/v1/chat/completions":
             self._send_json(404, {"error": "not found"})
             return
@@ -148,6 +171,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 max_total_tokens=self.config.context.max_total_tokens,
                 max_system_chars=self.config.context.max_system_prompt,
                 max_tool_result_chars=self.config.context.max_tool_result,
+                summarizer=self._summarize_dropped,
             )
 
             total_tokens = count_messages_tokens(messages)
@@ -160,6 +184,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             messages = truncate_conversation_history(
                 messages,
                 max_total_tokens=self.config.context.max_total_tokens,
+                summarizer=self._summarize_dropped,
             )
 
         # ── Build API request ────────────────────────────────────────
@@ -186,6 +211,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
 
     # ── Response handlers ────────────────────────────────────────────
+
+    def _summarize_dropped(self, dropped: List[Dict]) -> Optional[str]:
+        """Summarize dropped messages using a cheap CatPaw model."""
+        sc = self.config.context.summarize
+        if not sc.enabled:
+            return None
+
+        parts = []
+        for m in dropped:
+            role = m.get("role", "?")
+            content = str(m.get("content", ""))[:2000]
+            parts.append(f"[{role}]: {content}")
+        summary_text = "\n\n".join(parts)
+
+        req = {
+            "model": sc.model,
+            "messages": [
+                {"role": "system", "content": "You are a conversation summarizer. Create a concise paragraph summarizing the key topics, outputs, decisions, and conclusions from this conversation segment."},
+                {"role": "user", "content": f"Summarize this conversation segment:\n\n{summary_text}"}
+            ],
+            "max_tokens": sc.max_tokens,
+            "stream": False
+        }
+
+        try:
+            result = self.catpaw_client.call(req)
+            if result.get("code") != 0:
+                print(f"[WARN] Summarization API error: {result.get('msg', '?')}", file=sys.stderr)
+                return None
+            raw_data = result.get("data", result)
+            content = raw_data.get("content", "") or ""
+            if not content and raw_data.get("choices"):
+                content = raw_data["choices"][0].get("message", {}).get("content", "") or ""
+            return content.strip() if content else None
+        except Exception as e:
+            print(f"[WARN] Summarization call failed: {e}", file=sys.stderr)
+            return None
 
     def _handle_non_stream(self, api_body: dict, model: str, has_tools: bool = False):
         """Handle non-streaming request."""
