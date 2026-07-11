@@ -16,18 +16,99 @@ from typing import List, Dict, Any, Tuple, Optional
 
 
 # ── Tool name mapping ────────────────────────────────────────────────
-# Map tool names from consumer (Hermes) to environment-compatible names
+# Map tool names from consumer to CatPaw model names (forward)
+# and from CatPaw model to consumer native tools (reverse)
 TOOL_NAME_MAP = {
     "terminal_exec": "bash",
 }
 
 TOOL_NAME_MAP_REVERSE = {v: k for k, v in TOOL_NAME_MAP.items()}
 
+# Map CatPaw model tool names -> Agent native tool names
+# Agent defines these tools in the prompt but doesn't have
+# native implementations for them. Map to Agent's actual tools.
+CATPAW_TO_AGENT_TOOL_MAP = {
+    "bash": "bash",
+    "terminal_exec": "bash",
+    "file_list": "bash",
+    "file_read": "read",
+    "file_write": "write",
+    "file_edit": "edit",
+    "file_search": "grep",
+    "glob_file_search": "glob",
+    "grep_search": "grep",
+    "codebase_search": "grep",
+    "web_search": "webfetch",
+    "file_delete": "bash",
+    "file_move": "bash",
+    "file_multi_edit": "edit",
+    "terminal_background": "bash",
+}
+
 
 def map_tool_name(name: str, reverse: bool = False) -> str:
     """Map tool name between consumer and environment names."""
-    mapping = TOOL_NAME_MAP_REVERSE if reverse else TOOL_NAME_MAP
+    if reverse:
+        # First check CatPaw -> Agent mapping
+        mapped = CATPAW_TO_AGENT_TOOL_MAP.get(name)
+        if mapped:
+            return mapped
+        # Then check standard reverse mapping
+        return TOOL_NAME_MAP_REVERSE.get(name, name)
+    mapping = TOOL_NAME_MAP
     return mapping.get(name, name)
+
+
+def transform_tool_arguments(name: str, args: dict) -> dict:
+    """Transform tool arguments between CatPaw format and Agent native format."""
+    if name == "file_list":
+        path = args.get("directory_path") or args.get("path") or "."
+        return {"command": f"ls -la {_quote(path)}"}
+    if name == "file_delete":
+        path = args.get("target_file") or args.get("path") or ""
+        return {"command": f"rm -rf {_quote(path)}"}
+    if name == "file_move":
+        src = args.get("source") or args.get("source_path") or ""
+        dst = args.get("destination") or args.get("target_path") or ""
+        return {"command": f"mv {_quote(src)} {_quote(dst)}"}
+    if name == "terminal_background":
+        cmd = args.get("command") or ""
+        return {"command": cmd}
+    if name == "file_read":
+        path = args.get("target_file") or args.get("file_path") or ""
+        return {"filePath": path}
+    if name == "file_write":
+        path = args.get("target_file") or args.get("file_path") or ""
+        content = args.get("content") or args.get("file_content") or ""
+        return {"filePath": path, "content": content}
+    if name == "file_edit" or name == "file_multi_edit":
+        path = args.get("target_file") or args.get("file_path") or ""
+        old = args.get("old_string") or args.get("old") or ""
+        new = args.get("new_string") or args.get("new") or ""
+        return {"filePath": path, "oldString": old, "newString": new}
+    if name == "file_search" or name == "grep_search" or name == "codebase_search":
+        pattern = args.get("pattern") or args.get("query") or ""
+        path = args.get("path") or args.get("directory") or ""
+        result = {"pattern": pattern}
+        if path:
+            result["path"] = path
+        return result
+    if name == "glob_file_search":
+        pattern = args.get("pattern") or args.get("glob") or ""
+        return {"pattern": pattern}
+    if name == "web_search":
+        query = args.get("query") or ""
+        return {"query": query}
+    return args
+
+
+def _quote(s: str) -> str:
+    """Shell-quote a string argument."""
+    if not s:
+        return ""
+    if "'" in s:
+        s = s.replace("'", "'\\''")
+    return f"'{s}'"
 
 
 # ── Tool prompt construction ──────────────────────────────────────────
@@ -299,7 +380,7 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
                         "type": "function",
                         "function": {
                             "name": map_tool_name(name, reverse=True),
-                            "arguments": json.dumps(args, ensure_ascii=False)
+                            "arguments": json.dumps(transform_tool_arguments(name, args), ensure_ascii=False)
                         }
                     })
                 except json.JSONDecodeError:
@@ -353,12 +434,13 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
 
                     if name not in ('print', 'process', 'len', 'str', 'int', 'float',
                                     'dict', 'list', 'range', 'open', 'type', 'import'):
+                        mapped_name = map_tool_name(name, reverse=True)
                         tool_calls.append({
                             "id": f"call_{uuid.uuid4().hex[:24]}",
                             "type": "function",
                             "function": {
-                                "name": map_tool_name(name, reverse=True),
-                                "arguments": json.dumps(args, ensure_ascii=False)
+                                "name": mapped_name,
+                                "arguments": json.dumps(transform_tool_arguments(name, args), ensure_ascii=False)
                             }
                         })
             else:
@@ -370,8 +452,8 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
                         "id": f"call_{uuid.uuid4().hex[:24]}",
                         "type": "function",
                         "function": {
-                            "name": "terminal_exec",
-                            "arguments": json.dumps({"command": cmd}, ensure_ascii=False)
+                            "name": map_tool_name("terminal_exec", reverse=True),
+                            "arguments": json.dumps(transform_tool_arguments("terminal_exec", {"command": cmd}), ensure_ascii=False)
                         }
                     })
 
