@@ -115,6 +115,36 @@ def _merge_reasoning_into_content(reasoning: str, content: str) -> str:
     return f"<think>\n{reasoning}\n</think>"
 
 
+def _split_visible_reasoning(content: str) -> tuple[str, str]:
+    """Split an explicitly requested visible explanation from final content."""
+    opening = "<think>"
+    closing = "</think>"
+    start = content.find(opening)
+    if start < 0:
+        return "", content
+    end = content.find(closing, start + len(opening))
+    if end < 0:
+        return content[start + len(opening):].lstrip("\n"), ""
+    reasoning = content[start + len(opening):end].strip()
+    final_content = content[end + len(closing):].lstrip("\n")
+    return reasoning, final_content
+
+
+def _add_visible_reasoning_instruction(messages: List[Dict]) -> List[Dict]:
+    """Ask for a concise user-visible explanation, never hidden chain-of-thought."""
+    instruction = (
+        "Before the final answer, provide a concise user-visible explanation of "
+        "the approach in <think>...</think>. Do not provide hidden chain-of-thought; "
+        "give only a brief, useful rationale. Put the final answer after </think>."
+    )
+    updated = [dict(message) for message in messages]
+    if updated and updated[0].get("role") == "system":
+        updated[0]["content"] = f"{updated[0].get('content', '')}\n\n{instruction}".strip()
+    else:
+        updated.insert(0, {"role": "system", "content": instruction})
+    return updated
+
+
 def _attach_selected_code_context(messages: List[Dict], request: dict) -> List[Dict]:
     """Map simple OpenAI-style editor fields to CatPaw IDE's proven code attachment shape."""
     selected_code = request.get("selectedCode") or request.get("selected_code")
@@ -694,12 +724,16 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         stream = req_body.get("stream", False)
         tools = req_body.get("tools")
         tool_choice = req_body.get("tool_choice")
+        visible_reasoning = any(
+            str(req_body.get(field, "")).lower() in ("1", "true", "yes", "on")
+            for field in ("thinking", "visible_reasoning")
+        )
         use_ide_stream = req_body.get("ide_stream", req_body.get("catpaw_ide_stream"))
         if use_ide_stream is None:
             # OpenAI-compatible chat requests use the established chat endpoint.
-            # The IDE-specific endpoint remains available through /v1/ide/agent
-            # or an explicit ide_stream request flag.
-            use_ide_stream = os.environ.get("CATPAW_IDE_STREAM", "false")
+            # Thinking mode needs the IDE stream, which has proven to return its
+            # user-visible explanation before the final answer.
+            use_ide_stream = visible_reasoning or os.environ.get("CATPAW_IDE_STREAM", "false")
         use_ide_stream = str(use_ide_stream).lower() not in ("0", "false", "no", "off")
 
         if not messages:
@@ -707,6 +741,8 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             return
 
         messages = _attach_selected_code_context(messages, req_body)
+        if visible_reasoning:
+            messages = _add_visible_reasoning_instruction(messages)
 
         token = self.token_manager.get_token()
         if not token:
@@ -781,6 +817,20 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 forwarded_ide_fields.append(field)
         if forwarded_ide_fields:
             print(f"[DEBUG] Forwarding IDE context fields: {', '.join(forwarded_ide_fields)}", file=sys.stderr)
+
+        # IDE selects dynamic catalog models by numeric modelType, not just name.
+        # Resolve it when callers use a standard OpenAI model ID and did not
+        # explicitly provide userModelTypeCode.
+        if use_ide_stream and "userModelTypeCode" not in api_body:
+            try:
+                model_info = self.model_catalog.find_model(model)
+                model_type = model_info.get("modelType")
+                if model_type is not None:
+                    api_body["userModelTypeCode"] = model_type
+                    print(f"[DEBUG] Resolved {model} to CatPaw modelType {model_type}", file=sys.stderr)
+            except Exception as e:
+                print(f"[WARN] Could not resolve CatPaw model type for {model}: {e}", file=sys.stderr)
+
         # Default max_tokens for verbose output
         if "max_tokens" not in api_body:
             api_body["max_tokens"] = 16384
@@ -794,9 +844,9 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         try:
             if use_ide_stream and not tools:
                 if stream:
-                    self._handle_ide_stream(api_body, model)
+                    self._handle_ide_stream(api_body, model, visible_reasoning)
                 else:
-                    self._handle_ide_non_stream(api_body, model)
+                    self._handle_ide_non_stream(api_body, model, visible_reasoning)
             elif stream and not tools:
                 self._handle_stream(api_body, model, reasoning_mode)
             elif stream and tools:
@@ -884,7 +934,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         finally:
             conn.close()
 
-    def _handle_ide_stream(self, api_body: dict, model: str):
+    def _handle_ide_stream(self, api_body: dict, model: str, visible_reasoning: bool = False):
         """Expose CatPaw IDE cumulative content stream as OpenAI SSE deltas."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -902,9 +952,32 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             piece = event.get("choices", [{}])[0].get("delta", {}).get("content") if event.get("choices") else None
             if piece is None:
                 piece = cumulative[len(previous):] if cumulative.startswith(previous) else cumulative
-            previous = cumulative or previous
             if not piece:
+                previous = cumulative or previous
                 continue
+            if visible_reasoning:
+                reasoning, final_content = _split_visible_reasoning(cumulative)
+                previous_reasoning, previous_final = _split_visible_reasoning(previous)
+                reasoning_piece = reasoning[len(previous_reasoning):] if reasoning.startswith(previous_reasoning) else reasoning
+                final_piece = final_content[len(previous_final):] if final_content.startswith(previous_final) else final_content
+                for field, value in (("reasoning_content", reasoning_piece), ("content", final_piece)):
+                    if not value:
+                        continue
+                    delta = {field: value}
+                    if field == "reasoning_content":
+                        delta["reasoning"] = value
+                    chunk = {
+                        "id": event.get("id") or chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": event.get("created") or created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    }
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                previous = cumulative or previous
+                continue
+            previous = cumulative or previous
             chunk = {
                 "id": event.get("id") or chunk_id,
                 "object": "chat.completion.chunk",
@@ -926,7 +999,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-    def _handle_ide_non_stream(self, api_body: dict, model: str):
+    def _handle_ide_non_stream(self, api_body: dict, model: str, visible_reasoning: bool = False):
         """Aggregate CatPaw IDE cumulative content stream into one OpenAI response."""
         final_content = ""
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -942,12 +1015,19 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             content = event.get("content")
             if content and content != "[DONE]":
                 final_content = content
+        message = {"role": "assistant", "content": final_content}
+        if visible_reasoning:
+            reasoning, final_content = _split_visible_reasoning(final_content)
+            message["content"] = final_content
+            if reasoning:
+                message["reasoning_content"] = reasoning
+                message["reasoning"] = reasoning
         self._send_json(200, {
             "id": response_id,
             "object": "chat.completion",
             "created": created,
             "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": final_content}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
             "usage": usage,
         })
 

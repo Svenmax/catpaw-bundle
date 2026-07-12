@@ -141,6 +141,17 @@ curl http://127.0.0.1:4567/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 
+# 请求简短的可见思路，并用 OpenAI-compatible reasoning_content 流式字段返回。
+# thinking 不是模型内部隐藏推理开关；它要求模型生成简短、可见的理由说明。
+curl -N http://127.0.0.1:4567/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5.2",
+    "stream": true,
+    "thinking": true,
+    "messages": [{"role": "user", "content": "计算 27 乘以 43"}]
+  }'
+
 # 带工具调用
 curl http://127.0.0.1:4567/v1/chat/completions \
   -H "Content-Type: application/json" \

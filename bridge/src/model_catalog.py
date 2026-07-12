@@ -54,6 +54,14 @@ class ModelCatalog:
         self._cached_at = time.time()
         return models
 
+    def find_model(self, model_name: str) -> Dict[str, Any]:
+        """Find current-account model metadata by case-insensitive display name."""
+        normalized = (model_name or "").lower()
+        for model in self.get_models():
+            if str(model.get("modelTypeName", "")).lower() == normalized:
+                return model
+        return {}
+
 
 def as_openai_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Map CatPaw model metadata to OpenAI's compact /v1/models shape."""
