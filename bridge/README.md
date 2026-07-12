@@ -259,6 +259,36 @@ curl -X POST http://127.0.0.1:4567/v1/agent/conversations/CONVERSATION_ID/cancel
 
 The bridge does not execute agent-supplied commands locally. Native Agent/Pod tool execution stays in CatPaw's task environment. `reasoning_content` is mapped only from visible plan, thinking, or tool events and is not hidden model chain-of-thought.
 
+Clients restricted to `/v1/chat/completions` can opt into the same long-task lifecycle with the nonstandard `catpaw_agent` object. `stream: true` is required. The initial call creates a native Agent conversation; follow-ups reuse its `conversationId`. Read the initial `event: catpaw.agent` event to capture the conversation ID for the next request.
+
+```bash
+# Initial task through the standard OpenAI chat URL.
+curl -N http://127.0.0.1:4567/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minimax-m2.7",
+    "stream": true,
+    "messages": [{"role":"user","content":"Fix the failing tests and report verification."}],
+    "catpaw_agent": {
+      "gitRepoUrl": "https://github.com/org/repo.git",
+      "gitBaseBranch": "main",
+      "gitCheckoutBranch": "agent/fix-tests"
+    }
+  }'
+
+# Continue that long task through chat/completions.
+curl -N http://127.0.0.1:4567/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minimax-m2.7",
+    "stream": true,
+    "messages": [{"role":"user","content":"Now run the complete suite."}],
+    "catpaw_agent": {"conversationId":"CONVERSATION_ID"}
+  }'
+```
+
+This is an extension understood by CatPaw Bridge, not a field standardized by OpenAI. A client that cannot add custom JSON fields cannot request a native long task through chat completions alone; it must use the dedicated conversation endpoints or an adapter that adds `catpaw_agent`.
+
 ### 配置 Hermes Agent
 
 在 Hermes 的 `config.yaml` 中添加：

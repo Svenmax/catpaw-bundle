@@ -145,6 +145,22 @@ def _add_visible_reasoning_instruction(messages: List[Dict]) -> List[Dict]:
     return updated
 
 
+def _last_user_text(messages: List[Dict]) -> str:
+    """Return the final plain-text user prompt for a native Agent task."""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                item.get("text", "") for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+    return ""
+
+
 def _agent_event_text(event: object) -> tuple[str, str]:
     """Extract a best-effort visible text payload from a native Agent event."""
     if not isinstance(event, dict):
@@ -563,6 +579,9 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             self.end_headers()
             chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
+            created_event = {"conversation_id": conversation_id, "status": "connected", "message_index": message_index}
+            self.wfile.write(f"event: catpaw.agent\ndata: {json.dumps(created_event, ensure_ascii=False)}\n\n".encode())
+            self.wfile.flush()
             response_key = dict(response.getheaders()).get("encrypted-key")
             try:
                 for raw_line in response:
@@ -877,6 +896,44 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             messages = req_body.get("messages", [])
         model = req_body.get("model", "glm-5.2")
         stream = req_body.get("stream", False)
+
+        # Opt-in extension for clients that can only call chat/completions.
+        # Standard OpenAI chat has no durable-task or repository semantics, so
+        # callers must supply them under catpaw_agent.
+        agent_options = req_body.get("catpaw_agent")
+        agent_enabled = agent_options is True or isinstance(agent_options, dict)
+        if agent_enabled and self.path == "/v1/chat/completions":
+            agent_options = agent_options if isinstance(agent_options, dict) else {}
+            prompt = _last_user_text(messages)
+            conversation_id = agent_options.get("conversationId") or agent_options.get("conversation_id")
+            if not prompt and not conversation_id:
+                self._send_json(400, {"error": "catpaw_agent requires a user message or conversationId"})
+                return
+            if not stream:
+                self._send_json(400, {"error": "catpaw_agent requires stream: true"})
+                return
+            try:
+                client = RemoteAgentClient(self.token_manager, self.config.catpaw.api_host)
+                if conversation_id:
+                    client.continue_conversation(conversation_id, {"prompt": prompt})
+                else:
+                    agent_request = dict(agent_options)
+                    agent_request.setdefault("prompt", prompt)
+                    agent_request.setdefault("modelType", model)
+                    result = client.create_conversation(agent_request)
+                    conversation_id = result.get("conversationId") or result.get("id")
+                    if not conversation_id:
+                        raise RemoteAgentError("CatPaw Agent create returned no conversationId")
+                self.path = f"/v1/agent/conversations/{conversation_id}/stream?messageIndex=0"
+                self._handle_agent_stream_get()
+            except RemoteAgentError as e:
+                message = str(e)
+                status = 401 if "token not found" in message.lower() else (400 if "required" in message.lower() else 502)
+                self._send_json(status, {"error": message})
+            except Exception as e:
+                message = str(e)
+                self._send_json(401 if "token not found" in message.lower() else 502, {"error": message})
+            return
         tools = req_body.get("tools")
         tool_choice = req_body.get("tool_choice")
         visible_reasoning = any(
