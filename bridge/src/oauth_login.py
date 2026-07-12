@@ -141,7 +141,9 @@ class PhoneOAuthLogin(_BaseLogin):
         data = self._request("POST", "/api/login/sendSmsVerificationCode", body)
         if data.get("code") != 0:
             raise RuntimeError(f"Failed to send SMS code: {data.get('msg', 'unknown')}")
-        return data["data"]["requestCode"]
+        # Newer login responses may acknowledge delivery without requestCode.
+        result = data.get("data") or {}
+        return result.get("requestCode") or result.get("request_code") or ""
 
     def login(self, mobile_no: str, verification_code: str) -> QRCodeLoginResult:
         """Verify code and get tokens."""
