@@ -73,9 +73,18 @@ def build_create_conversation_body(request: Dict[str, Any]) -> Dict[str, Any]:
     if not git_repo_url:
         raise RemoteAgentError("gitRepoUrl is required")
 
+    # Match the current IDE Remote Agent UI: its backend workspace is provisioned
+    # only for repositories on the internal Git host, not arbitrary GitHub URLs.
+    normalized_repo_url = str(git_repo_url).strip()
+    if not normalized_repo_url.startswith("ssh://git@git.sankuai.com"):
+        raise RemoteAgentError(
+            "CatPaw Remote Agent does not support external Git repositories; "
+            "gitRepoUrl must start with ssh://git@git.sankuai.com"
+        )
+
     body = {
         "modelType": request.get("modelType") or request.get("model") or "minimax-m2.7",
-        "gitRepoUrl": git_repo_url,
+        "gitRepoUrl": normalized_repo_url if normalized_repo_url.endswith(".git") else f"{normalized_repo_url}.git",
         "gitBaseBranch": request.get("gitBaseBranch") or request.get("baseBranch") or request.get("git_base_branch") or "master",
         "gitCheckoutBranch": request.get("gitCheckoutBranch") or request.get("checkoutBranch") or request.get("git_checkout_branch") or "",
         "prompt": prompt,

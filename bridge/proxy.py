@@ -826,7 +826,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 })
             except RemoteAgentError as e:
                 message = str(e)
-                status = 401 if "token not found" in message.lower() else (400 if "required" in message.lower() else 502)
+                status = 401 if "token not found" in message.lower() else (400 if ("required" in message.lower() or "does not support external" in message.lower()) else 502)
                 self._send_json(status, {"error": message})
             except Exception as e:
                 message = str(e)
@@ -881,10 +881,12 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 result = client.create_conversation(req_body)
                 self._send_json(200, {"status": "ok", "data": result})
             except RemoteAgentError as e:
-                status = 400 if "required" in str(e).lower() else 502
-                self._send_json(status, {"error": str(e)})
+                message = str(e)
+                status = 401 if "token not found" in message.lower() else (400 if ("required" in message.lower() or "does not support external" in message.lower()) else 502)
+                self._send_json(status, {"error": message})
             except Exception as e:
-                self._send_json(500, {"error": str(e)})
+                message = str(e)
+                self._send_json(401 if "token not found" in message.lower() else 500, {"error": message})
             return
 
         if self.path not in ("/v1/chat/completions", "/v1/ide/agent"):
@@ -938,7 +940,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 self._handle_agent_stream_get()
             except RemoteAgentError as e:
                 message = str(e)
-                status = 401 if "token not found" in message.lower() else (400 if "required" in message.lower() else 502)
+                status = 401 if "token not found" in message.lower() else (400 if ("required" in message.lower() or "does not support external" in message.lower()) else 502)
                 self._send_json(status, {"error": message})
             except Exception as e:
                 message = str(e)
