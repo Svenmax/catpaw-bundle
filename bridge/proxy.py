@@ -27,6 +27,7 @@ import time
 import uuid
 import argparse
 import threading
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Dict, Optional
 
@@ -43,6 +44,112 @@ from src.tool_translator import (
 from src.tool_filter import filter_tools_by_query
 from src.context_manager import truncate_conversation_history
 from src.token_counter import count_messages_tokens
+from src.crypto import decrypt_response_body
+from src.ide_agent import build_ide_messages, list_capabilities
+from src.remote_agent import RemoteAgentClient, RemoteAgentError, build_remote_agent_shell
+from src.model_catalog import ModelCatalog, as_openai_models
+
+
+def _extract_reasoning(payload: dict) -> str:
+    """Extract reasoning/thinking text from CatPaw/OpenAI-like payloads."""
+    if not isinstance(payload, dict):
+        return ""
+
+    for key in ("reasoning", "reasoning_content", "reasoningContent", "thinking"):
+        value = payload.get(key)
+        if value:
+            return value
+
+    details = payload.get("reasoningDetails") or payload.get("reasoning_details")
+    if isinstance(details, list):
+        parts = []
+        for item in details:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("thinking") or item.get("content")
+                if text:
+                    parts.append(str(text))
+            elif item:
+                parts.append(str(item))
+        if parts:
+            return "\n".join(parts)
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        if isinstance(choice, dict):
+            for nested_key in ("delta", "message"):
+                nested = choice.get(nested_key)
+                extracted = _extract_reasoning(nested) if isinstance(nested, dict) else ""
+                if extracted:
+                    return extracted
+    return ""
+
+
+def _reasoning_mode(req_body: dict) -> str:
+    """Return how reasoning should be exposed to clients."""
+    value = req_body.get("reasoning_mode") or req_body.get("include_reasoning")
+    if value is None:
+        value = os.environ.get("CATPAW_REASONING_MODE", "content")
+    if isinstance(value, bool):
+        return "content" if value else "fields"
+    value = str(value).lower().strip()
+    aliases = {
+        "1": "content",
+        "true": "content",
+        "yes": "content",
+        "on": "content",
+        "0": "fields",
+        "false": "fields",
+        "no": "fields",
+        "off": "fields",
+    }
+    return aliases.get(value, value if value in ("content", "fields", "both", "none") else "content")
+
+
+def _merge_reasoning_into_content(reasoning: str, content: str) -> str:
+    if not reasoning:
+        return content or ""
+    if content:
+        return f"<think>\n{reasoning}\n</think>\n\n{content}"
+    return f"<think>\n{reasoning}\n</think>"
+
+
+def _attach_selected_code_context(messages: List[Dict], request: dict) -> List[Dict]:
+    """Map simple OpenAI-style editor fields to CatPaw IDE's proven code attachment shape."""
+    selected_code = request.get("selectedCode") or request.get("selected_code")
+    if not selected_code:
+        return messages
+
+    updated = [dict(message) for message in messages]
+    target_index = next((index for index in range(len(updated) - 1, -1, -1)
+                         if updated[index].get("role") == "user"), None)
+    if target_index is None:
+        return updated
+
+    target = dict(updated[target_index])
+    # Do not overwrite callers that already provide native IDE attachments.
+    if target.get("attachedCodeChunks") or target.get("chatSelectContextTagList"):
+        return updated
+
+    path = request.get("filePath") or request.get("file_path") or "selected-code"
+    language = request.get("language") or ""
+    line_count = max(1, str(selected_code).count("\n") + 1)
+    target["chatSelectContextTagList"] = [{
+        "type": "CODE",
+        "relativePath": path,
+        "startLine": 1,
+        "endLine": line_count,
+        "content": selected_code,
+        "language": language,
+    }]
+    target["attachedCodeChunks"] = [{
+        "path": path,
+        "startLine": 0,
+        "endLine": line_count - 1,
+        "content": selected_code,
+    }]
+    updated[target_index] = target
+    return updated
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -52,6 +159,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     config: Config = None
     catpaw_client: CatPawClient = None
     token_manager: TokenManager = None
+    model_catalog: ModelCatalog = None
+
 
     def log_message(self, format, *args):
         print(f"[{self.log_date_time_string()}] {format % args}", file=sys.stderr)
@@ -326,11 +435,20 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             self._send_html(200, self.LOGIN_PAGE_HTML)
 
         elif self.path == "/v1/models":
-            models = [
-                {"id": m, "object": "model", "created": 1700000000, "owned_by": "catpaw"}
-                for m in self.config.models
-            ]
-            self._send_json(200, {"object": "list", "data": models})
+            source = "config"
+            try:
+                models = as_openai_models(self.model_catalog.get_models())
+                if models:
+                    source = "catpaw"
+                else:
+                    raise RuntimeError("CatPaw returned an empty model catalog")
+            except Exception as e:
+                print(f"[WARN] Dynamic model catalog unavailable, using config fallback: {e}", file=sys.stderr)
+                models = [
+                    {"id": m, "object": "model", "created": 1700000000, "owned_by": "catpaw"}
+                    for m in self.config.models
+                ]
+            self._send_json(200, {"object": "list", "data": models, "source": source})
 
         elif self.path == "/health":
             token = self.token_manager.get_token()
@@ -339,6 +457,15 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 "token_prefix": token[:20] + "..." if token else None,
                 "models": self.config.models,
             })
+
+        elif self.path == "/v1/ide/capabilities":
+            self._send_json(200, {
+                "object": "list",
+                "data": list_capabilities(),
+            })
+
+        elif self.path.startswith("/v1/remote-agent/"):
+            self._handle_remote_agent_get()
 
         elif self.path == "/login/qrcode":
             from src.oauth_login import QRCodeOAuthLogin
@@ -355,6 +482,51 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
 
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _handle_remote_agent_get(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        conversation_id = (query.get("conversationId") or query.get("conversation_id") or [""])[0]
+        timeout = float((query.get("timeout") or ["120"])[0])
+        interval = float((query.get("interval") or ["2"])[0])
+        client = RemoteAgentClient(self.token_manager, self.config.catpaw.api_host)
+
+        try:
+            if parsed.path == "/v1/remote-agent/detail":
+                detail = client.get_detail(conversation_id)
+                self._send_json(200, {"status": "ok", "data": detail})
+                return
+
+            if parsed.path == "/v1/remote-agent/wait":
+                detail = client.wait_for_pod(conversation_id, timeout=timeout, interval=interval)
+                self._send_json(200, {"status": "ok", "data": detail})
+                return
+
+            if parsed.path == "/v1/remote-agent/pod":
+                detail = client.get_detail(conversation_id)
+                pod_url = detail.get("podUrl")
+                if not pod_url:
+                    self._send_json(202, {"status": "starting", "data": detail})
+                    return
+                if (query.get("redirect") or [""])[0].lower() in ("1", "true", "yes"):
+                    self.send_response(302)
+                    self.send_header("Location", pod_url)
+                    self.end_headers()
+                    return
+                self._send_json(200, {"status": "ok", "podUrl": pod_url, "data": detail})
+                return
+
+            if parsed.path == "/v1/remote-agent/open":
+                detail = client.get_detail(conversation_id)
+                self._send_html(200, build_remote_agent_shell(detail))
+                return
+
+            self._send_json(404, {"error": "not found"})
+        except RemoteAgentError as e:
+            status = 401 if "token not found" in str(e).lower() else 502
+            self._send_json(status, {"error": str(e)})
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
 
     def do_POST(self):
         if self.path == "/token":
@@ -475,7 +647,26 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 self._send_json(500, {"error": str(e)})
             return
 
-        if self.path != "/v1/chat/completions":
+        if self.path == "/v1/remote-agent/create":
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len)
+            try:
+                req_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            try:
+                client = RemoteAgentClient(self.token_manager, self.config.catpaw.api_host)
+                result = client.create_conversation(req_body)
+                self._send_json(200, {"status": "ok", "data": result})
+            except RemoteAgentError as e:
+                status = 400 if "required" in str(e).lower() else 502
+                self._send_json(status, {"error": str(e)})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+
+        if self.path not in ("/v1/chat/completions", "/v1/ide/agent"):
             self._send_json(404, {"error": "not found"})
             return
 
@@ -487,15 +678,25 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             self._send_json(400, {"error": "invalid JSON"})
             return
 
-        messages = req_body.get("messages", [])
-        model = req_body.get("model", "minimax-m2.7")
+        ide_action = None
+        if self.path == "/v1/ide/agent":
+            ide_action, messages = build_ide_messages(req_body)
+        else:
+            messages = req_body.get("messages", [])
+        model = req_body.get("model", "glm-5.2")
         stream = req_body.get("stream", False)
         tools = req_body.get("tools")
         tool_choice = req_body.get("tool_choice")
+        use_ide_stream = req_body.get("ide_stream", req_body.get("catpaw_ide_stream"))
+        if use_ide_stream is None:
+            use_ide_stream = os.environ.get("CATPAW_IDE_STREAM", "true")
+        use_ide_stream = str(use_ide_stream).lower() not in ("0", "false", "no", "off")
 
         if not messages:
             self._send_json(400, {"error": "messages is required"})
             return
+
+        messages = _attach_selected_code_context(messages, req_body)
 
         token = self.token_manager.get_token()
         if not token:
@@ -537,7 +738,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 from src.token_counter import count_message_tokens
                 print(f"[DEBUG]   msg[{i}] role={m.get('role','?')} ~{count_message_tokens(m)} tokens", file=sys.stderr)
         else:
-            # No tools, just truncate history
+            # Stateless OpenAI compatibility fallback. Keep recent turns and summarize only when needed.
             messages = truncate_conversation_history(
                 messages,
                 max_total_tokens=self.config.context.max_total_tokens,
@@ -550,6 +751,26 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                   "presence_penalty", "response_format"]:
             if k in req_body:
                 api_body[k] = req_body[k]
+
+        # CatPaw IDE Chat attaches editor/repository context alongside its full
+        # messages array. Preserve these documented request fields instead of
+        # trying to serialize them into an artificial system prompt.
+        ide_context_fields = [
+            "selectedCode", "before", "after", "language", "filePath",
+            "conversationId", "triggerMode", "gitUrl", "remoteBranch",
+            "pluginList", "promptTemplateWithContext", "call",
+            "chatSelectContextTagList", "extraContextList", "searchStrategy",
+            "userModelTypeCode", "mrulesContent", "planPromptEnabled",
+            "chatApplyModeType", "attachedCodeChunks", "attachedDocChunks",
+            "attachedWebPages", "attachedUrlChunks", "attachedKmPages",
+        ]
+        forwarded_ide_fields = []
+        for field in ide_context_fields:
+            if field in req_body:
+                api_body[field] = req_body[field]
+                forwarded_ide_fields.append(field)
+        if forwarded_ide_fields:
+            print(f"[DEBUG] Forwarding IDE context fields: {', '.join(forwarded_ide_fields)}", file=sys.stderr)
         # Default max_tokens for verbose output
         if "max_tokens" not in api_body:
             api_body["max_tokens"] = 16384
@@ -558,13 +779,20 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             api_body["temperature"] = 0.85
 
         # ── Send request ─────────────────────────────────────────────
+        reasoning_mode = _reasoning_mode(req_body)
+
         try:
-            if stream and not tools:
-                self._handle_stream(api_body, model)
+            if use_ide_stream and not tools:
+                if stream:
+                    self._handle_ide_stream(api_body, model)
+                else:
+                    self._handle_ide_non_stream(api_body, model)
+            elif stream and not tools:
+                self._handle_stream(api_body, model, reasoning_mode)
             elif stream and tools:
-                self._handle_stream_with_tools(api_body, model)
+                self._handle_stream_with_tools(api_body, model, reasoning_mode)
             else:
-                self._handle_non_stream(api_body, model, bool(tools))
+                self._handle_non_stream(api_body, model, bool(tools), reasoning_mode)
         except Exception as e:
             import traceback
             print(f"[ERROR] Proxy error: {e}\n{traceback.format_exc()}", file=sys.stderr)
@@ -612,7 +840,108 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             print(f"[WARN] Summarization call failed: {e}", file=sys.stderr)
             return None
 
-    def _handle_non_stream(self, api_body: dict, model: str, has_tools: bool = False):
+    def _iter_ide_stream_events(self, api_body: dict):
+        """Yield decoded events from CatPaw IDE's cumulative content stream."""
+        ide_client = CatPawClient(self.config.catpaw.api_host, "/api/gpt/openai/stream", self.token_manager)
+        body = dict(api_body)
+        body["stream"] = True
+        resp, conn = ide_client.call_stream(body)
+        resp_headers = dict(resp.getheaders())
+        resp_enc_key = resp_headers.get("encrypted-key")
+        try:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_str = line[5:].strip()
+                else:
+                    continue
+                if data_str == "[DONE]":
+                    break
+                if resp_enc_key and not data_str.startswith("{"):
+                    data_str = decrypt_response_body(data_str, resp_enc_key)
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("content") == "[DONE]" or event.get("lastOne") is True:
+                    yield event
+                    break
+                yield event
+        finally:
+            conn.close()
+
+    def _handle_ide_stream(self, api_body: dict, model: str):
+        """Expose CatPaw IDE cumulative content stream as OpenAI SSE deltas."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        previous = ""
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        for event in self._iter_ide_stream_events(api_body):
+            cumulative = event.get("content") or ""
+            if cumulative == "[DONE]":
+                break
+            piece = event.get("choices", [{}])[0].get("delta", {}).get("content") if event.get("choices") else None
+            if piece is None:
+                piece = cumulative[len(previous):] if cumulative.startswith(previous) else cumulative
+            previous = cumulative or previous
+            if not piece:
+                continue
+            chunk = {
+                "id": event.get("id") or chunk_id,
+                "object": "chat.completion.chunk",
+                "created": event.get("created") or created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+            }
+            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+            self.wfile.flush()
+
+        done_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        self.wfile.write(f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _handle_ide_non_stream(self, api_body: dict, model: str):
+        """Aggregate CatPaw IDE cumulative content stream into one OpenAI response."""
+        final_content = ""
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        for event in self._iter_ide_stream_events(api_body):
+            if event.get("id"):
+                response_id = event["id"]
+            if event.get("created"):
+                created = event["created"]
+            if event.get("usage"):
+                usage = event["usage"]
+            content = event.get("content")
+            if content and content != "[DONE]":
+                final_content = content
+        self._send_json(200, {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": final_content}, "finish_reason": "stop"}],
+            "usage": usage,
+        })
+
+    def _handle_non_stream(self, api_body: dict, model: str, has_tools: bool = False, reasoning_mode: str = "content"):
         """Handle non-streaming request."""
         result = self.catpaw_client.call(api_body)
 
@@ -627,11 +956,11 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             raw_content = raw_data["choices"][0].get("message", {}).get("content", "") or ""
         print(f"[DEBUG] Raw model response: {raw_content[:500]}", file=sys.stderr)
 
-        openai_resp = self._to_openai_response(result, model, has_tools)
+        openai_resp = self._to_openai_response(result, model, has_tools, reasoning_mode)
         print(f"[DEBUG] Parsed tool_calls: {len(openai_resp['choices'][0]['message'].get('tool_calls', []))}", file=sys.stderr)
         self._send_json(200, openai_resp)
 
-    def _handle_stream_with_tools(self, api_body: dict, model: str):
+    def _handle_stream_with_tools(self, api_body: dict, model: str, reasoning_mode: str = "content"):
         """Handle streaming request with tools: internal non-stream, external simulated stream."""
         api_body["stream"] = False
         result = self.catpaw_client.call(api_body)
@@ -645,11 +974,11 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         if not raw_content and raw_data.get("choices"):
             raw_content = raw_data["choices"][0].get("message", {}).get("content", "") or ""
         print(f"[DEBUG] Raw model response: {raw_content[:500]}", file=sys.stderr)
-        catpaw_reasoning = raw_data.get("reasoning", "") or (raw_data.get("choices") and raw_data["choices"][0].get("message", {}).get("reasoning", "")) or ""
+        catpaw_reasoning = _extract_reasoning(raw_data)
         if catpaw_reasoning:
             print(f"[DEBUG] Reasoning: {catpaw_reasoning[:300]}", file=sys.stderr)
 
-        openai_resp = self._to_openai_response(result, model, True)
+        openai_resp = self._to_openai_response(result, model, True, reasoning_mode)
         print(f"[DEBUG] Parsed tool_calls: {len(openai_resp['choices'][0]['message'].get('tool_calls', []))}", file=sys.stderr)
 
         # Start SSE response
@@ -689,14 +1018,17 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
         else:
-            reasoning = message.get("reasoning", "") or ""
+            reasoning = message.get("reasoning_content", "") or message.get("reasoning", "") or ""
             content = message.get("content", "") or ""
 
-            if reasoning:
+            if reasoning and reasoning_mode in ("fields", "both"):
                 chunk = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {"reasoning": reasoning}, "finish_reason": None}]}
+                         "choices": [{"index": 0, "delta": {"reasoning_content": reasoning, "reasoning": reasoning}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
+
+            if reasoning and reasoning_mode in ("content", "both"):
+                content = _merge_reasoning_into_content(reasoning, content)
 
             chunk_size = 20
             for i in range(0, len(content), chunk_size):
@@ -714,7 +1046,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-    def _handle_stream(self, api_body: dict, model: str):
+    def _handle_stream(self, api_body: dict, model: str, reasoning_mode: str = "content"):
         """Handle pure streaming request (no tools)."""
         resp, conn = self.catpaw_client.call_stream(api_body)
 
@@ -767,10 +1099,15 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                     if delta_content == "[DONE]":
                         continue
                     reasoning_content = delta.pop("reasoning_content", None)
-                    if reasoning_content:
+                    if reasoning_content and reasoning_mode in ("fields", "both"):
                         reason_chunk = copy.deepcopy(openai_chunk)
-                        reason_chunk["choices"][0]["delta"] = {"reasoning_content": reasoning_content}
+                        reason_chunk["choices"][0]["delta"] = {"reasoning_content": reasoning_content, "reasoning": reasoning_content}
                         self.wfile.write(f"data: {json.dumps(reason_chunk, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                    if reasoning_content and reasoning_mode in ("content", "both"):
+                        think_chunk = copy.deepcopy(openai_chunk)
+                        think_chunk["choices"][0]["delta"] = {"content": _merge_reasoning_into_content(reasoning_content, "") + "\n\n"}
+                        self.wfile.write(f"data: {json.dumps(think_chunk, ensure_ascii=False)}\n\n".encode())
                         self.wfile.flush()
                     if delta:
                         self.wfile.write(f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n".encode())
@@ -800,11 +1137,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             delta = choice.get("delta")
             if delta and isinstance(delta, dict):
                 content = (delta.get("content") or "")
-                reasoning = (delta.get("reasoning") or delta.get("reasoning_content") or delta.get("reasoningContent") or "")
-                if not reasoning and delta.get("reasoningDetails"):
-                    rd = delta["reasoningDetails"]
-                    if isinstance(rd, list) and len(rd) > 0:
-                        reasoning = rd[0].get("text") or rd[0].get("thinking") or ""
+                reasoning = _extract_reasoning(delta)
             finish_reason = choice.get("finishReason") or choice.get("finish_reason")
 
         if not content and not finish_reason:
@@ -813,12 +1146,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 content = top_content
 
         if not content and not reasoning:
-            top_reasoning = (catpaw_data.get("reasoning") or catpaw_data.get("reasoning_content") or catpaw_data.get("reasoningContent") or "")
-            if not top_reasoning and catpaw_data.get("reasoningDetails"):
-                rd = catpaw_data["reasoningDetails"]
-                if isinstance(rd, list) and len(rd) > 0:
-                    top_reasoning = rd[0].get("text") or rd[0].get("thinking") or ""
-            reasoning = reasoning or top_reasoning
+            reasoning = reasoning or _extract_reasoning(catpaw_data)
 
         if not content and not reasoning and not finish_reason:
             return None
@@ -841,12 +1169,12 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             }],
         }
 
-    def _to_openai_response(self, catpaw_resp: dict, model: str, has_tools: bool = False) -> dict:
+    def _to_openai_response(self, catpaw_resp: dict, model: str, has_tools: bool = False, reasoning_mode: str = "content") -> dict:
         """Convert CatPaw response to standard OpenAI format."""
         data = catpaw_resp.get("data", catpaw_resp)
         choices = data.get("choices", [])
         content = data.get("content", "") or ""
-        reasoning = (data.get("reasoning", "") or data.get("reasoning_content", "") or data.get("reasoningContent", "") or "")
+        reasoning = _extract_reasoning(data)
         finish_reason = "stop"
 
         if choices:
@@ -855,7 +1183,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             if not content:
                 content = msg.get("content", "") or ""
             if not reasoning:
-                reasoning = (msg.get("reasoning", "") or msg.get("reasoning_content", "") or msg.get("reasoningContent", "") or "")
+                reasoning = _extract_reasoning(msg)
             finish_reason = ch.get("finishReason") or ch.get("finish_reason") or "stop"
 
         if has_tools:
@@ -864,9 +1192,13 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             remaining_content = content
             tool_calls = []
 
+        if reasoning and reasoning_mode in ("content", "both"):
+            remaining_content = _merge_reasoning_into_content(reasoning, remaining_content)
+
         message = {"role": "assistant", "content": remaining_content if remaining_content else None}
-        if reasoning:
+        if reasoning and reasoning_mode in ("fields", "both", "content"):
             message["reasoning"] = reasoning
+            message["reasoning_content"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
             finish_reason = "tool_calls"
@@ -925,6 +1257,7 @@ def main():
     ProxyHandler.config = config
     ProxyHandler.token_manager = token_manager
     ProxyHandler.catpaw_client = catpaw_client
+    ProxyHandler.model_catalog = ModelCatalog(token_manager, config.catpaw.api_host)
 
     server = HTTPServer((config.server.host, config.server.port), ProxyHandler)
     print(f"[INFO] Proxy ready at http://{config.server.host}:{config.server.port}", file=sys.stderr)

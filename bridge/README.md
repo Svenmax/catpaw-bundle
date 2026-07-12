@@ -162,6 +162,61 @@ curl http://127.0.0.1:4567/v1/chat/completions \
   }'
 ```
 
+### IDE Agent 兼容接口
+
+Bridge 额外暴露了 CatPaw IDE 中 agent 相关命令的 HTTP 入口，不依赖 VS Code webview：
+
+```bash
+# 查看支持的 IDE Agent 能力
+curl http://127.0.0.1:4567/v1/ide/capabilities
+
+# 调用“解释代码”能力
+curl http://127.0.0.1:4567/v1/ide/agent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "explain",
+    "model": "glm-5.2",
+    "selection": "function add(a, b) { return a + b }"
+  }'
+```
+
+`action` 支持：`chat`、`send_prompt`、`explain`、`bug`、`test`、`comment`、`refactor`、`commit_message`、`testagent_selected_file`、`testagent_all_changes`、`agent_review`、`agent_review_changes`、`deploy_plan`。也可以直接传 CatPaw IDE command ID，例如 `idekit.mcopilot.explain.selected` 或 `catpaw.triggerAgentReview`。
+
+请求可携带：`prompt`、`selection`/`selected_text`、`files`、`diff`、`diagnostics`、`workspace`、`context`。Bridge 会把这些上下文整理成 CatPaw Agent 风格的消息，再走现有加密 API、token 和模型配置。
+
+### Remote Agent 兼容接口
+
+CatPaw IDE 的 Remote Agent 主要是一个 webview 壳：先通过 `conversationId` 查询远程 Pod 信息，再把返回的 `podUrl` 嵌入界面。Bridge 提供同等能力：
+
+```bash
+# 创建 Remote Agent 任务
+curl http://127.0.0.1:4567/v1/remote-agent/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "修复测试失败并提交总结",
+    "gitRepoUrl": "https://github.com/org/repo.git",
+    "gitBaseBranch": "main",
+    "gitCheckoutBranch": "agent/fix-tests",
+    "modelType": "minimax-m2.7",
+    "autoPullRequest": false,
+    "autoDeploy": false
+  }'
+
+# 查询 Remote Agent 详情
+curl 'http://127.0.0.1:4567/v1/remote-agent/detail?conversationId=xxx'
+
+# 等待 Pod ready，并返回 podUrl
+curl 'http://127.0.0.1:4567/v1/remote-agent/wait?conversationId=xxx&timeout=120'
+
+# 返回可直接打开的 iframe 容器页
+open 'http://127.0.0.1:4567/v1/remote-agent/open?conversationId=xxx'
+
+# 只取 podUrl，或 redirect=1 直接跳转
+curl 'http://127.0.0.1:4567/v1/remote-agent/pod?conversationId=xxx'
+```
+
+Remote Agent 的思考过程渲染发生在 `podUrl` 指向的远程 webapp 内；Bridge 复刻的是 VS Code 侧查询 detail、等待 pod、打开容器页的能力。
+
 ### 配置 Hermes Agent
 
 在 Hermes 的 `config.yaml` 中添加：
@@ -205,6 +260,13 @@ providers:
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI 兼容的聊天补全接口 |
 | `/v1/models` | GET | 返回可用模型列表 |
+| `/v1/ide/capabilities` | GET | 返回 bridge 暴露的 CatPaw IDE Agent 能力 |
+| `/v1/ide/agent` | POST | 以 IDE 命令语义调用 Agent，如解释/查 bug/生成测试/评审 |
+| `/v1/remote-agent/create` | POST | 创建 Remote Agent 任务，返回 `conversationId` |
+| `/v1/remote-agent/detail` | GET | 查询 Remote Agent conversation detail |
+| `/v1/remote-agent/wait` | GET | 轮询等待 Remote Agent Pod ready |
+| `/v1/remote-agent/open` | GET | 返回嵌入 `podUrl` 的 Remote Agent 容器页 |
+| `/v1/remote-agent/pod` | GET | 返回或跳转到 Remote Agent `podUrl` |
 | `/health` | GET | 健康检查，返回 token 状态 |
 
 ## 配置项
