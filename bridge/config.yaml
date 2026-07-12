@@ -24,7 +24,7 @@ models:
 
 # Context management
 context:
-  max_total_tokens: 48000
+  max_total_tokens: 6800
   max_system_prompt: 5000
   max_tool_result: 8000
   max_tool_prompt: 4000
