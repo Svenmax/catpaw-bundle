@@ -116,18 +116,28 @@ def _merge_reasoning_into_content(reasoning: str, content: str) -> str:
 
 
 def _split_visible_reasoning(content: str) -> tuple[str, str]:
-    """Split an explicitly requested visible explanation from final content."""
+    """Split visible reasoning while withholding incomplete stream tag fragments."""
     opening = "<think>"
     closing = "</think>"
     start = content.find(opening)
     if start < 0:
+        # Do not leak a partial opening tag while cumulative SSE text arrives.
+        if opening.startswith(content):
+            return "", ""
         return "", content
+    before = content[:start]
     end = content.find(closing, start + len(opening))
     if end < 0:
-        return content[start + len(opening):].lstrip("\n"), ""
+        reasoning = content[start + len(opening):]
+        # The closing tag may itself arrive token by token. Hold its prefix.
+        for length in range(min(len(reasoning), len(closing) - 1), 0, -1):
+            if closing.startswith(reasoning[-length:]):
+                reasoning = reasoning[:-length]
+                break
+        return reasoning.lstrip("\n"), ""
     reasoning = content[start + len(opening):end].strip()
-    final_content = content[end + len(closing):].lstrip("\n")
-    return reasoning, final_content
+    final_content = before + content[end + len(closing):]
+    return reasoning, final_content.lstrip("\n")
 
 
 def _add_visible_reasoning_instruction(messages: List[Dict]) -> List[Dict]:
