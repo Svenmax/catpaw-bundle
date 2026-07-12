@@ -145,6 +145,28 @@ def _add_visible_reasoning_instruction(messages: List[Dict]) -> List[Dict]:
     return updated
 
 
+def _agent_event_text(event: object) -> tuple[str, str]:
+    """Extract a best-effort visible text payload from a native Agent event."""
+    if not isinstance(event, dict):
+        return "", ""
+    payload = event.get("data") if isinstance(event.get("data"), dict) else event
+    message_type = str(payload.get("messageType") or payload.get("type") or payload.get("role") or "").lower()
+    text = ""
+    for key in ("content", "text", "message", "reasoning", "thinking", "expandContent"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            text = value
+            break
+    if not text and isinstance(payload.get("blockData"), dict):
+        block = payload["blockData"]
+        for key in ("content", "text", "message"):
+            if isinstance(block.get(key), str) and block[key]:
+                text = block[key]
+                break
+    is_reasoning = any(marker in message_type for marker in ("think", "plan", "analysis", "tool"))
+    return text, "reasoning_content" if is_reasoning else "content"
+
+
 def _attach_selected_code_context(messages: List[Dict], request: dict) -> List[Dict]:
     """Map simple OpenAI-style editor fields to CatPaw IDE's proven code attachment shape."""
     selected_code = request.get("selectedCode") or request.get("selected_code")
@@ -498,6 +520,9 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 "data": list_capabilities(),
             })
 
+        elif request_path.startswith("/v1/agent/conversations/") and request_path.endswith("/stream"):
+            self._handle_agent_stream_get()
+
         elif self.path.startswith("/v1/remote-agent/"):
             self._handle_remote_agent_get()
 
@@ -516,6 +541,73 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
 
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _handle_agent_stream_get(self):
+        """Stream a native CatPaw Agent conversation as OpenAI-compatible SSE."""
+        parsed = urllib.parse.urlparse(self.path)
+        parts = [part for part in parsed.path.split("/") if part]
+        conversation_id = parts[3] if len(parts) == 5 else ""
+        query = urllib.parse.parse_qs(parsed.query)
+        try:
+            message_index = int((query.get("messageIndex") or query.get("message_index") or ["0"])[0])
+        except ValueError:
+            self._send_json(400, {"error": "messageIndex must be an integer"})
+            return
+        client = RemoteAgentClient(self.token_manager, self.config.catpaw.api_host)
+        try:
+            response, conn = client.connect_stream(conversation_id, message_index)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+            created = int(time.time())
+            response_key = dict(response.getheaders()).get("encrypted-key")
+            try:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    if response_key and not payload.startswith("{"):
+                        payload = decrypt_response_body(payload.strip('"'), response_key)
+                    try:
+                        event = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    raw_event = {"conversation_id": conversation_id, "event": event}
+                    self.wfile.write(f"event: catpaw.agent\ndata: {json.dumps(raw_event, ensure_ascii=False)}\n\n".encode())
+                    text, field = _agent_event_text(event)
+                    if text:
+                        delta = {field: text}
+                        if field == "reasoning_content":
+                            delta["reasoning"] = text
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": "catpaw-agent",
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                        }
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    if str(event.get("statusUpdate", "")).lower() in ("canceled", "completed", "finished", "failed"):
+                        break
+                    self.wfile.flush()
+            finally:
+                conn.close()
+            done = {"id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                    "model": "catpaw-agent", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            self.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
+            self.wfile.flush()
+        except RemoteAgentError as e:
+            status = 401 if "token not found" in str(e).lower() else 502
+            self._send_json(status, {"error": str(e)})
+        except Exception as e:
+            message = str(e)
+            self._send_json(401 if "token not found" in message.lower() else 502, {"error": message})
 
     def _handle_remote_agent_get(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -682,6 +774,69 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 })
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
+            return
+
+        if self.path == "/v1/agent/conversations":
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len)
+            try:
+                req_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            try:
+                client = RemoteAgentClient(self.token_manager, self.config.catpaw.api_host)
+                result = client.create_conversation(req_body)
+                conversation_id = result.get("conversationId") or result.get("id")
+                self._send_json(201, {
+                    "id": conversation_id,
+                    "object": "catpaw.agent.conversation",
+                    "status": result.get("status") or "created",
+                    "data": result,
+                    "stream_url": f"/v1/agent/conversations/{conversation_id}/stream" if conversation_id else None,
+                })
+            except RemoteAgentError as e:
+                message = str(e)
+                status = 401 if "token not found" in message.lower() else (400 if "required" in message.lower() else 502)
+                self._send_json(status, {"error": message})
+            except Exception as e:
+                message = str(e)
+                self._send_json(401 if "token not found" in message.lower() else 500, {"error": message})
+            return
+
+        if self.path.startswith("/v1/agent/conversations/") and self.path.endswith("/continue"):
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len)
+            try:
+                req_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            conversation_id = self.path.split("/")[4]
+            try:
+                client = RemoteAgentClient(self.token_manager, self.config.catpaw.api_host)
+                result = client.continue_conversation(conversation_id, req_body)
+                self._send_json(200, {"id": conversation_id, "object": "catpaw.agent.conversation", "data": result})
+            except RemoteAgentError as e:
+                message = str(e)
+                self._send_json(401 if "token not found" in message.lower() else 502, {"error": message})
+            except Exception as e:
+                message = str(e)
+                self._send_json(401 if "token not found" in message.lower() else 500, {"error": message})
+            return
+
+        if self.path.startswith("/v1/agent/conversations/") and self.path.endswith("/cancel"):
+            conversation_id = self.path.split("/")[4]
+            try:
+                client = RemoteAgentClient(self.token_manager, self.config.catpaw.api_host)
+                result = client.stop_conversation(conversation_id)
+                self._send_json(200, {"id": conversation_id, "object": "catpaw.agent.conversation", "status": "cancel_requested", "data": result})
+            except RemoteAgentError as e:
+                message = str(e)
+                self._send_json(401 if "token not found" in message.lower() else 502, {"error": message})
+            except Exception as e:
+                message = str(e)
+                self._send_json(401 if "token not found" in message.lower() else 500, {"error": message})
             return
 
         if self.path == "/v1/remote-agent/create":

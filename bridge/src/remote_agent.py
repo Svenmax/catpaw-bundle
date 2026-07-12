@@ -14,6 +14,7 @@ import time
 import urllib.parse
 from typing import Any, Dict, Optional
 
+from .catpaw_client import CatPawClient
 from .crypto import decrypt_response_body
 from .token_manager import TokenManager
 
@@ -165,6 +166,31 @@ class RemoteAgentClient:
         if not isinstance(data, dict):
             raise RemoteAgentError(f"CatPaw Remote Agent create returned no object: {data}")
         return data
+
+    def connect_stream(self, conversation_id: str, message_index: int = 0):
+        """Connect to the native CatPaw Agent SSE stream used by the IDE."""
+        if not conversation_id:
+            raise RemoteAgentError("conversationId is required")
+        client = CatPawClient(self.host, "/api/agent/stream/connect", self.token_manager)
+        return client.call_stream({
+            "timestamp": int(time.time() * 1000),
+            "conversationId": conversation_id,
+            "messageIndex": max(0, int(message_index)),
+        })
+
+    def continue_conversation(self, conversation_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Continue an existing native Agent conversation with a new user input."""
+        if not conversation_id:
+            raise RemoteAgentError("conversationId is required")
+        body = dict(request)
+        body["conversationId"] = conversation_id
+        return self._request_json("POST", "/api/agent/conversation/continue", body)
+
+    def stop_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        """Request cancellation of a native Agent conversation."""
+        if not conversation_id:
+            raise RemoteAgentError("conversationId is required")
+        return self._request_json("POST", "/api/agent/conversation/stop", {"conversationId": conversation_id})
 
     def wait_for_pod(self, conversation_id: str, timeout: float = 120.0, interval: float = 2.0) -> Dict[str, Any]:
 

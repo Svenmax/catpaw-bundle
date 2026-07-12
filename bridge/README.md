@@ -228,6 +228,37 @@ curl 'http://127.0.0.1:4567/v1/remote-agent/pod?conversationId=xxx'
 
 Remote Agent 的思考过程渲染发生在 `podUrl` 指向的远程 webapp 内；Bridge 复刻的是 VS Code 侧查询 detail、等待 pod、打开容器页的能力。
 
+### Native Agent Long Tasks
+
+`/v1/chat/completions` remains a one-shot chat API. For IDE-style long tasks, use the native Agent conversation endpoints. They preserve a CatPaw `conversationId` and use the same upstream lifecycle as the IDE: create, connect to its event stream, continue, and cancel.
+
+```bash
+# 1. Create a task. The response has id and stream_url.
+curl http://127.0.0.1:4567/v1/agent/conversations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Inspect the test failures, fix them, and report verification.",
+    "gitRepoUrl": "https://github.com/org/repo.git",
+    "gitBaseBranch": "main",
+    "gitCheckoutBranch": "agent/fix-tests",
+    "modelType": "minimax-m2.7"
+  }'
+
+# 2. Subscribe to native Agent progress. Standard chunks carry content or
+# reasoning_content; event: catpaw.agent preserves each raw CatPaw event.
+curl -N 'http://127.0.0.1:4567/v1/agent/conversations/CONVERSATION_ID/stream?messageIndex=0'
+
+# 3. Send a follow-up or supply fields accepted by CatPaw's native continue API.
+curl http://127.0.0.1:4567/v1/agent/conversations/CONVERSATION_ID/continue \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Run the focused tests and continue."}'
+
+# 4. Request cancellation.
+curl -X POST http://127.0.0.1:4567/v1/agent/conversations/CONVERSATION_ID/cancel
+```
+
+The bridge does not execute agent-supplied commands locally. Native Agent/Pod tool execution stays in CatPaw's task environment. `reasoning_content` is mapped only from visible plan, thinking, or tool events and is not hidden model chain-of-thought.
+
 ### 配置 Hermes Agent
 
 在 Hermes 的 `config.yaml` 中添加：
@@ -273,6 +304,10 @@ providers:
 | `/v1/models` | GET | 返回可用模型列表 |
 | `/v1/ide/capabilities` | GET | 返回 bridge 暴露的 CatPaw IDE Agent 能力 |
 | `/v1/ide/agent` | POST | 以 IDE 命令语义调用 Agent，如解释/查 bug/生成测试/评审 |
+| `/v1/agent/conversations` | POST | 创建原生 CatPaw 长任务会话，返回 `conversationId` 与 stream URL |
+| `/v1/agent/conversations/{id}/stream` | GET | 订阅原生 Agent 事件，输出 OpenAI chunk 与 `catpaw.agent` SSE 事件 |
+| `/v1/agent/conversations/{id}/continue` | POST | 继续原生 Agent 会话 |
+| `/v1/agent/conversations/{id}/cancel` | POST | 请求停止原生 Agent 会话 |
 | `/v1/remote-agent/create` | POST | 创建 Remote Agent 任务，返回 `conversationId` |
 | `/v1/remote-agent/detail` | GET | 查询 Remote Agent conversation detail |
 | `/v1/remote-agent/wait` | GET | 轮询等待 Remote Agent Pod ready |
