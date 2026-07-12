@@ -700,7 +700,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 self._send_json(400, {"error": "accessToken is required"})
                 return
 
-            self.token_manager.set_token_from_external(access_token, refresh_token)
+            self.token_manager.set_token_from_external(access_token, refresh_token, req_body.get("expires"))
             self._send_json(200, {
                 "status": "ok",
                 "token_prefix": access_token[:20] + "...",
@@ -730,7 +730,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 access_token = status.get("accessToken")
 
                 if access_token:
-                    self.token_manager.set_token_from_external(access_token, status.get("refreshToken"))
+                    self.token_manager.set_token_from_external(access_token, status.get("refreshToken"), status.get("expires"))
                     self.token_manager.write_to_state_db(access_token, status.get("refreshToken"))
                     self._send_json(200, {
                         "status": "ok",
@@ -794,7 +794,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                 phone_oauth = self.__class__.phone_oauth or PhoneOAuthLogin()
                 result = phone_oauth.login(mobile_no, verification_code)
                 self.__class__.phone_oauth = None
-                self.token_manager.set_token_from_external(result.access_token, result.refresh_token)
+                self.token_manager.set_token_from_external(result.access_token, result.refresh_token, result.expires)
                 self.token_manager.write_to_state_db(result.access_token, result.refresh_token)
                 self._send_json(200, {
                     "status": "ok",
@@ -1132,6 +1132,11 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         resp, conn = ide_client.call_stream(body)
         resp_headers = dict(resp.getheaders())
         resp_enc_key = resp_headers.get("encrypted-key")
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        terminal_reason = "stop"
+        terminal_usage = None
+        terminal_event = None
         try:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -1373,6 +1378,11 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         resp_headers = dict(resp.getheaders())
         resp_enc_key = resp_headers.get("encrypted-key")
 
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        terminal_reason = "stop"
+        terminal_usage = None
+        terminal_event = None
         try:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -1403,8 +1413,17 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                         continue
 
                 catpaw_data_check = data.get("data", data)
+                if catpaw_data_check.get("usage"):
+                    terminal_usage = catpaw_data_check["usage"]
+                raw_choices = catpaw_data_check.get("choices", [])
+                if raw_choices and isinstance(raw_choices[0], dict):
+                    raw_reason = raw_choices[0].get("finishReason") or raw_choices[0].get("finish_reason")
+                    if raw_reason:
+                        terminal_reason = raw_reason
+                        terminal_event = data
                 if catpaw_data_check.get("content") == "[DONE]":
-                    continue
+                    terminal_event = data
+                    break
 
                 openai_chunk = self._convert_stream_chunk(data, model)
                 if openai_chunk:
@@ -1427,6 +1446,18 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
                         self.wfile.write(f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n".encode())
                         self.wfile.flush()
 
+            final_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": terminal_reason}],
+            }
+            if terminal_usage:
+                final_chunk["usage"] = terminal_usage
+            self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+            if terminal_event:
+                self.wfile.write(f"event: catpaw.meta\ndata: {json.dumps(terminal_event, ensure_ascii=False)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except Exception as e:

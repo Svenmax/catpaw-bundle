@@ -41,7 +41,7 @@ class TokenManager:
             data = {
                 "accessToken": token,
                 "ts": time.time(),
-                "ttl": ttl,
+                "ttl": max(1, int(ttl)),
             }
             if refresh_token:
                 data["refreshToken"] = refresh_token
@@ -51,12 +51,23 @@ class TokenManager:
         except Exception as e:
             print(f"[WARN] Cache file write failed: {e}", file=sys.stderr)
 
-    def set_token_from_external(self, token: str, refresh_token: str = None) -> bool:
-        """Accept token from external source (e.g. Bridge /token endpoint)."""
+    def set_token_from_external(self, token: str, refresh_token: str = None, expires=None) -> bool:
+        """Accept token from an external login flow and retain its real lifetime."""
+        ttl = 3600
+        if expires is not None:
+            try:
+                value = float(expires)
+                # CatPaw mobile login returns an absolute epoch timestamp in ms.
+                if value > 10_000_000_000:
+                    ttl = max(1, int(value / 1000 - time.time()))
+                else:
+                    ttl = max(1, int(value))
+            except (TypeError, ValueError):
+                print(f"[WARN] Invalid external token expiry {expires!r}; using 3600s cache", file=sys.stderr)
         self._cache["value"] = token
         self._cache["ts"] = time.time()
-        self._write_cache_file(token, refresh_token)
-        print(f"[INFO] Token set from external source: {token[:20]}...", file=sys.stderr)
+        self._write_cache_file(token, refresh_token, ttl)
+        print(f"[INFO] Token set from external source: {token[:20]}... (cache ttl={ttl}s)", file=sys.stderr)
         return True
 
     def _read_plugin_auth(self, cur) -> Optional[str]:
