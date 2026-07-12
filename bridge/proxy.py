@@ -160,6 +160,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     catpaw_client: CatPawClient = None
     token_manager: TokenManager = None
     model_catalog: ModelCatalog = None
+    phone_oauth = None
 
 
     def log_message(self, format, *args):
@@ -431,10 +432,12 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
 </html>"""
 
     def do_GET(self):
-        if self.path == "/" or self.path == "":
+        request_path = urllib.parse.urlparse(self.path).path
+
+        if request_path == "/" or request_path == "":
             self._send_html(200, self.LOGIN_PAGE_HTML)
 
-        elif self.path == "/v1/models":
+        elif request_path == "/v1/models":
             source = "config"
             try:
                 models = as_openai_models(self.model_catalog.get_models())
@@ -610,8 +613,10 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
 
             from src.oauth_login import PhoneOAuthLogin
             try:
-                phone_oauth = PhoneOAuthLogin()
-                request_code = phone_oauth.send_code(mobile_no)
+                # The verification endpoint binds the SMS code to this UUID.
+                # Retain the login object so /login/loginByPhone uses it too.
+                self.__class__.phone_oauth = PhoneOAuthLogin()
+                request_code = self.__class__.phone_oauth.send_code(mobile_no)
                 self._send_json(200, {"status": "ok", "request_code": request_code})
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
@@ -634,8 +639,9 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
 
             from src.oauth_login import PhoneOAuthLogin
             try:
-                phone_oauth = PhoneOAuthLogin()
+                phone_oauth = self.__class__.phone_oauth or PhoneOAuthLogin()
                 result = phone_oauth.login(mobile_no, verification_code)
+                self.__class__.phone_oauth = None
                 self.token_manager.set_token_from_external(result.access_token, result.refresh_token)
                 self.token_manager.write_to_state_db(result.access_token, result.refresh_token)
                 self._send_json(200, {
@@ -689,7 +695,10 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         tool_choice = req_body.get("tool_choice")
         use_ide_stream = req_body.get("ide_stream", req_body.get("catpaw_ide_stream"))
         if use_ide_stream is None:
-            use_ide_stream = os.environ.get("CATPAW_IDE_STREAM", "true")
+            # OpenAI-compatible chat requests use the established chat endpoint.
+            # The IDE-specific endpoint remains available through /v1/ide/agent
+            # or an explicit ide_stream request flag.
+            use_ide_stream = os.environ.get("CATPAW_IDE_STREAM", "false")
         use_ide_stream = str(use_ide_stream).lower() not in ("0", "false", "no", "off")
 
         if not messages:
