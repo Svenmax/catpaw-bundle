@@ -342,6 +342,48 @@ def _extract_balanced_json(text: str, start: int) -> Tuple[Optional[str], int]:
     return None, start
 
 
+def normalize_tool_calls_for_schema(tool_calls: List[dict], tools: List[dict]) -> List[dict]:
+    """Keep calls within the caller's tool schema and fill safe defaults."""
+    definitions = {
+        tool.get("function", {}).get("name"): tool.get("function", {})
+        for tool in tools
+        if tool.get("type") == "function" and tool.get("function", {}).get("name")
+    }
+    normalized = []
+    for tool_call in tool_calls:
+        function = tool_call.get("function", {})
+        name = function.get("name", "")
+        definition = definitions.get(name)
+        if not definition:
+            print(f"[WARN] Dropping undeclared tool call: {name}", file=sys.stderr)
+            continue
+
+        try:
+            arguments = json.loads(function.get("arguments", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        parameters = definition.get("parameters", {})
+        properties = parameters.get("properties", {})
+        if properties:
+            arguments = {key: value for key, value in arguments.items() if key in properties}
+
+        # The local Agent bash tool requires these fields, while CatPaw often omits them.
+        if name == "bash":
+            if "workdir" in properties and not arguments.get("workdir"):
+                arguments["workdir"] = "/workspace"
+            if "description" in properties and not arguments.get("description"):
+                arguments["description"] = "Execute requested shell command"
+
+        updated = dict(tool_call)
+        updated["function"] = dict(function)
+        updated["function"]["arguments"] = json.dumps(arguments, ensure_ascii=False)
+        normalized.append(updated)
+    return normalized
+
+
 def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
     """
     Parse tool calls from model response content.

@@ -39,6 +39,7 @@ from src.token_manager import TokenManager
 from src.catpaw_client import CatPawClient
 from src.tool_translator import (
     convert_messages_with_tools,
+    normalize_tool_calls_for_schema,
     parse_tool_calls_from_content,
 )
 from src.tool_filter import filter_tools_by_query
@@ -799,9 +800,9 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             elif stream and not tools:
                 self._handle_stream(api_body, model, reasoning_mode)
             elif stream and tools:
-                self._handle_stream_with_tools(api_body, model, reasoning_mode)
+                self._handle_stream_with_tools(api_body, model, tools, reasoning_mode)
             else:
-                self._handle_non_stream(api_body, model, bool(tools), reasoning_mode)
+                self._handle_non_stream(api_body, model, tools, reasoning_mode)
         except Exception as e:
             import traceback
             print(f"[ERROR] Proxy error: {e}\n{traceback.format_exc()}", file=sys.stderr)
@@ -950,7 +951,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             "usage": usage,
         })
 
-    def _handle_non_stream(self, api_body: dict, model: str, has_tools: bool = False, reasoning_mode: str = "content"):
+    def _handle_non_stream(self, api_body: dict, model: str, tools: Optional[List[dict]] = None, reasoning_mode: str = "content"):
         """Handle non-streaming request."""
         result = self.catpaw_client.call(api_body)
 
@@ -965,11 +966,11 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             raw_content = raw_data["choices"][0].get("message", {}).get("content", "") or ""
         print(f"[DEBUG] Raw model response: {raw_content[:500]}", file=sys.stderr)
 
-        openai_resp = self._to_openai_response(result, model, has_tools, reasoning_mode)
+        openai_resp = self._to_openai_response(result, model, bool(tools), reasoning_mode, tools)
         print(f"[DEBUG] Parsed tool_calls: {len(openai_resp['choices'][0]['message'].get('tool_calls', []))}", file=sys.stderr)
         self._send_json(200, openai_resp)
 
-    def _handle_stream_with_tools(self, api_body: dict, model: str, reasoning_mode: str = "content"):
+    def _handle_stream_with_tools(self, api_body: dict, model: str, tools: List[dict], reasoning_mode: str = "content"):
         """Handle streaming request with tools: internal non-stream, external simulated stream."""
         api_body["stream"] = False
         result = self.catpaw_client.call(api_body)
@@ -987,7 +988,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         if catpaw_reasoning:
             print(f"[DEBUG] Reasoning: {catpaw_reasoning[:300]}", file=sys.stderr)
 
-        openai_resp = self._to_openai_response(result, model, True, reasoning_mode)
+        openai_resp = self._to_openai_response(result, model, True, reasoning_mode, tools)
         print(f"[DEBUG] Parsed tool_calls: {len(openai_resp['choices'][0]['message'].get('tool_calls', []))}", file=sys.stderr)
 
         # Start SSE response
@@ -1178,7 +1179,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             }],
         }
 
-    def _to_openai_response(self, catpaw_resp: dict, model: str, has_tools: bool = False, reasoning_mode: str = "content") -> dict:
+    def _to_openai_response(self, catpaw_resp: dict, model: str, has_tools: bool = False, reasoning_mode: str = "content", tools: Optional[List[dict]] = None) -> dict:
         """Convert CatPaw response to standard OpenAI format."""
         data = catpaw_resp.get("data", catpaw_resp)
         choices = data.get("choices", [])
@@ -1197,6 +1198,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
 
         if has_tools:
             remaining_content, tool_calls = parse_tool_calls_from_content(content)
+            tool_calls = normalize_tool_calls_for_schema(tool_calls, tools or [])
         else:
             remaining_content = content
             tool_calls = []
