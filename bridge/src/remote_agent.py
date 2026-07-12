@@ -107,8 +107,10 @@ class RemoteAgentClient:
         if not token:
             raise RemoteAgentError("CatPaw token not found. Make sure CatPaw IDE is logged in.")
 
-        body = json.dumps(request_body or {}, ensure_ascii=False) if method != "GET" else None
+        body = json.dumps(request_body or {}, ensure_ascii=False).encode("utf-8") if method != "GET" else None
         headers = self.token_manager.build_headers(token)
+        if body is not None:
+            headers["Content-Type"] = "application/json; charset=utf-8"
         conn = http.client.HTTPSConnection(self.host, context=self._ssl_ctx)
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
@@ -121,8 +123,11 @@ class RemoteAgentClient:
             token = self.token_manager.get_token()
             if token:
                 headers = self.token_manager.build_headers(token)
+                if request_body is not None and method != "GET":
+                    headers["Content-Type"] = "application/json; charset=utf-8"
+                retry_body = json.dumps(request_body or {}, ensure_ascii=False).encode("utf-8") if method != "GET" else None
                 conn = http.client.HTTPSConnection(self.host, context=self._ssl_ctx)
-                conn.request(method, path, body=body, headers=headers)
+                conn.request(method, path, body=retry_body, headers=headers)
                 resp = conn.getresponse()
                 resp_headers = dict(resp.getheaders())
                 body = resp.read().decode("utf-8", errors="replace")
