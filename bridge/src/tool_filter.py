@@ -164,6 +164,16 @@ def filter_tools_by_query(
                 selected.append(tool)
                 selected_names.add(name)
 
+    # Callers can expose native tool names that differ from CatPaw's
+    # configured aliases. Keep their complete tool set when no configured
+    # core tool or query match exists, rather than injecting an empty prompt.
+    if not selected:
+        selected = [tool for tool in tools if tool.get("type") == "function"]
+        selected_names = {
+            tool.get("function", {}).get("name", "")
+            for tool in selected
+        }
+
     # Sort by priority (core tools first)
     priority_order = list(always_include)
     def sort_key(t):

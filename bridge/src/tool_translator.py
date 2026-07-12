@@ -61,6 +61,22 @@ def map_tool_name(name: str, reverse: bool = False) -> str:
 
 def transform_tool_arguments(name: str, args: dict) -> dict:
     """Transform tool arguments between CatPaw format and Agent native format."""
+    # Some models emit a generic `arg` field despite the injected schema.
+    # Normalize it for common single-argument native tools.
+    if set(args) == {"arg"}:
+        single_arg_names = {
+            "bash": "command",
+            "terminal_exec": "command",
+            "terminal_background": "command",
+            "read": "filePath",
+            "glob": "pattern",
+            "grep": "pattern",
+            "webfetch": "url",
+            "skill": "name",
+        }
+        arg_name = single_arg_names.get(name)
+        if arg_name:
+            args = {arg_name: args["arg"]}
     if name == "file_list":
         path = args.get("directory_path") or args.get("path") or "."
         return {"command": f"ls -la {_quote(path)}"}
@@ -331,10 +347,8 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
     Parse tool calls from model response content.
     Returns (remaining_content, tool_calls_list).
 
-    Parsing strategies (in order):
-    1. <tool_call> XML tags with balanced-brace JSON extraction
-    2. Code blocks with function-call syntax (func_name(key='value'))
-    3. Code blocks with shell commands (converted to terminal_exec)
+    Tool calls must use <tool_call> XML tags with a JSON payload. Markdown
+    code blocks are ordinary assistant output and must remain untouched.
     """
     if not content:
         return "", []
@@ -387,79 +401,6 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
         remaining = re.sub(r'<tool_call>.*?(?:</tool_call>|(?=\n\n|\Z))', '', content, flags=re.DOTALL).strip()
         remaining = remaining.replace('</tool_call>', '').strip()
         if tool_calls:
-            return remaining, tool_calls
-
-    # Method 2: Code blocks (function calls or shell commands)
-    code_block_pattern = re.compile(r'```(?:python|bash|shell|sh|javascript|json)?\s*\n(.*?)\n```', re.DOTALL)
-    code_blocks = code_block_pattern.findall(content)
-    if code_blocks:
-        for block in code_blocks:
-            # Skip code blocks that look like Python code examples
-            stripped = block.strip()
-            if re.search(r'^(def |class |import |from |@|# |async def )', stripped, re.MULTILINE):
-                continue
-            func_pattern = re.compile(r"(\w+)\s*\(\s*(.*?)\s*\)", re.DOTALL)
-            func_matches = list(func_pattern.finditer(block))
-
-            if func_matches:
-                for fm in func_matches:
-                    name = fm.group(1)
-                    # Skip function definitions (def name(): / async def name():)
-                    line_start = block.rfind('\n', 0, fm.start()) + 1
-                    line_prefix = block[line_start:fm.start()].strip()
-                    if line_prefix in ('def', 'async def'):
-                        continue
-                    args_str = fm.group(2).strip()
-                    args = {}
-                    if args_str:
-                        kv_pattern = re.compile(r"(\w+)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^,]+))")
-                        for kv in kv_pattern.finditer(args_str):
-                            key = kv.group(1)
-                            val = kv.group(2) or kv.group(3) or kv.group(4)
-                            if val is None:
-                                continue
-                            val = val.strip()
-                            if val.lower() == 'true':
-                                val = True
-                            elif val.lower() == 'false':
-                                val = False
-                            else:
-                                try:
-                                    val = int(val)
-                                except ValueError:
-                                    try:
-                                        val = float(val)
-                                    except ValueError:
-                                        pass
-                            args[key] = val
-
-                    if name not in ('print', 'process', 'len', 'str', 'int', 'float',
-                                    'dict', 'list', 'range', 'open', 'type', 'import'):
-                        mapped_name = map_tool_name(name, reverse=True)
-                        tool_calls.append({
-                            "id": f"call_{uuid.uuid4().hex[:24]}",
-                            "type": "function",
-                            "function": {
-                                "name": mapped_name,
-                                "arguments": json.dumps(transform_tool_arguments(name, args), ensure_ascii=False)
-                            }
-                        })
-            else:
-                # Shell command block
-                cmd = block.strip()
-                if cmd and not cmd.startswith('#'):
-                    cmd = cmd.split('\n')[0].strip()
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:24]}",
-                        "type": "function",
-                        "function": {
-                            "name": map_tool_name("terminal_exec", reverse=True),
-                            "arguments": json.dumps(transform_tool_arguments("terminal_exec", {"command": cmd}), ensure_ascii=False)
-                        }
-                    })
-
-        if tool_calls:
-            remaining = code_block_pattern.sub("", content).strip()
             return remaining, tool_calls
 
     return content, []
