@@ -200,7 +200,11 @@ class TokenManager:
             self._cache["ts"] = time.time()
             self._cache["refreshed_from_server"] = True
 
-            self._write_cache_file(new_access_token, new_refresh_token)
+            # CatPaw may rotate the refresh token. Persist both credentials so
+            # the next heartbeat and auth-retry use the latest token pair.
+            active_refresh_token = new_refresh_token or refresh_token
+            self._write_cache_file(new_access_token, active_refresh_token)
+            self.write_to_state_db(new_access_token, active_refresh_token)
 
             if new_refresh_token:
                 print(f"[INFO] Server returned new refreshToken as well", file=sys.stderr)

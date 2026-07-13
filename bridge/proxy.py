@@ -907,7 +907,9 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         else:
             messages = req_body.get("messages", [])
         model = req_body.get("model", "glm-5.2")
-        stream = req_body.get("stream", False)
+        # Prefer SSE for callers that omit stream; explicit false preserves
+        # one-shot OpenAI-compatible responses for clients that require them.
+        stream = req_body.get("stream", True)
 
         # Opt-in extension for clients that can only call chat/completions.
         # Standard OpenAI chat has no durable-task or repository semantics, so
@@ -1076,7 +1078,7 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             elif stream and tools:
                 self._handle_stream_with_tools(api_body, model, tools, reasoning_mode)
             else:
-                self._handle_non_stream(api_body, model, tools, reasoning_mode)
+                self._handle_non_stream(api_body, model, tools, reasoning_mode, tool_choice)
         except Exception as e:
             import traceback
             print(f"[ERROR] Proxy error: {e}\n{traceback.format_exc()}", file=sys.stderr)
@@ -1260,7 +1262,14 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
             "usage": usage,
         })
 
-    def _handle_non_stream(self, api_body: dict, model: str, tools: Optional[List[dict]] = None, reasoning_mode: str = "content"):
+    def _handle_non_stream(
+        self,
+        api_body: dict,
+        model: str,
+        tools: Optional[List[dict]] = None,
+        reasoning_mode: str = "content",
+        tool_choice=None,
+    ):
         """Handle non-streaming request."""
         result = self.catpaw_client.call(api_body)
 
@@ -1276,6 +1285,23 @@ document.addEventListener('DOMContentLoaded', function() { refreshQR(); });
         print(f"[DEBUG] Raw model response: {raw_content[:500]}", file=sys.stderr)
 
         openai_resp = self._to_openai_response(result, model, bool(tools), reasoning_mode, tools)
+        requires_tool = tool_choice == "required" or isinstance(tool_choice, dict)
+        message = openai_resp["choices"][0]["message"]
+        if tools and requires_tool and not message.get("tool_calls"):
+            retry_body = dict(api_body)
+            retry_messages = list(api_body["messages"])
+            retry_messages.append({
+                "role": "user",
+                "content": "You must respond with exactly one declared tool call now. Do not explain or answer in prose.",
+            })
+            retry_body["messages"] = retry_messages
+            print("[WARN] Required tool call missing; retrying with a strict instruction", file=sys.stderr)
+            result = self.catpaw_client.call(retry_body)
+            if result.get("code") != 0:
+                import json as _json
+                err_detail = _json.dumps(result, ensure_ascii=False)[:500]
+                raise RuntimeError(f"CatPaw API error: {result.get('msg', 'unknown')}. Full response: {err_detail}")
+            openai_resp = self._to_openai_response(result, model, True, reasoning_mode, tools)
         print(f"[DEBUG] Parsed tool_calls: {len(openai_resp['choices'][0]['message'].get('tool_calls', []))}", file=sys.stderr)
         self._send_json(200, openai_resp)
 

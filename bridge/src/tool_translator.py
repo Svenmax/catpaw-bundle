@@ -149,12 +149,21 @@ def build_tool_system_prefix() -> str:
         "\n"
         "## Guidelines\n"
         "1. When asked to DO something (list files, run commands, read data), use the appropriate tool.\n"
-        "2. Use bash for system commands (df, du, ls, cat, ps, etc.)\n"
-        "3. Use file_read/file_write/file_list for file operations.\n"
+        "2. Call only a tool listed under Available Tools, using its exact name and declared parameters.\n"
+        "3. Never invent tool names, aliases, or parameters.\n"
         "4. After receiving tool results, analyze them thoroughly and provide detailed explanations.\n"
         "5. For code examples and explanations, write them inside code blocks (```python ... ```).\n"
         "6. Do NOT use tools for code examples - tools are only for actual execution.\n"
         "7. Always provide comprehensive, detailed responses with in-depth analysis.\n"
+        "\n"
+        "## Complex Task Execution\n"
+        "1. Infer the task type and choose the smallest suitable tool sequence for its goal.\n"
+        "2. Before acting, identify the current objective, available evidence, and the next uncertainty to resolve.\n"
+        "3. Choose tools from the task context: inspect known files directly, search unknown code locations, use browser tools for web tasks, and use write or edit tools only when a change is required.\n"
+        "4. For code analysis with known identifiers, prefer searching exact function, class, route, or identifier names; use broader searches when the implementation location is unknown.\n"
+        "5. For multi-step tasks, use each tool result to update the plan and choose the next action; stop when the requested completion criteria are satisfied.\n"
+        "6. Read every file explicitly required by the user before reaching a conclusion.\n"
+        "7. Final answers must distinguish verified facts from inferences and cite relevant evidence when the task requires analysis or review.\n"
         "---\n"
     )
 
@@ -306,6 +315,13 @@ def convert_messages_with_tools(
     # If no system message, add one
     if not any(m.get("role") == "system" for m in converted):
         full_prompt = tool_prefix + tool_suffix
+        if tool_choice and tool_choice != "auto" and tool_choice != "none":
+            if isinstance(tool_choice, dict):
+                forced_name = tool_choice.get("function", {}).get("name", "")
+                if forced_name:
+                    full_prompt += f"\n\nYou MUST call the tool '{forced_name}' now."
+            elif tool_choice == "required":
+                full_prompt += "\n\nYou MUST call one of the available tools now."
         converted.insert(0, {"role": "system", "content": full_prompt})
 
     return converted

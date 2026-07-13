@@ -67,7 +67,9 @@ class CatPawClient:
             except AuthError:
                 if attempt < MAX_RETRIES - 1:
                     print(f"[WARN] Auth failed, refreshing token and retrying ({attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
-                    self.token_manager.refresh_token()
+                    # The token read from the IDE database can be the same
+                    # rejected token. Refresh it at the SSO server first.
+                    self.token_manager.refresh_from_server()
                     time.sleep(RETRY_DELAY)
                 else:
                     raise RuntimeError(f"CatPaw API auth failed after {MAX_RETRIES} retries")
@@ -91,7 +93,8 @@ class CatPawClient:
                 conn.close()
                 if attempt < MAX_RETRIES - 1:
                     print(f"[WARN] Auth failed, refreshing token and retrying ({attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
-                    self.token_manager.refresh_token()
+                    # Keep the streaming retry path aligned with non-streaming calls.
+                    self.token_manager.refresh_from_server()
                     time.sleep(RETRY_DELAY)
                 else:
                     raise RuntimeError(f"CatPaw API auth failed after {MAX_RETRIES} retries")
