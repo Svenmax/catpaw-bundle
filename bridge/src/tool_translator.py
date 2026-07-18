@@ -405,8 +405,9 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
     Parse tool calls from model response content.
     Returns (remaining_content, tool_calls_list).
 
-    Tool calls must use <tool_call> XML tags with a JSON payload. Markdown
-    code blocks are ordinary assistant output and must remain untouched.
+    Tool calls normally use <tool_call> XML tags with a JSON payload. As a
+    constrained fallback, a response consisting solely of one shell code block
+    becomes a bash tool call. Other Markdown remains ordinary assistant output.
     """
     if not content:
         return "", []
@@ -460,5 +461,21 @@ def parse_tool_calls_from_content(content: str) -> Tuple[str, List[dict]]:
         remaining = remaining.replace('</tool_call>', '').strip()
         if tool_calls:
             return remaining, tool_calls
+
+    # Some models ignore the XML instruction and emit only a shell snippet.
+    # Require the complete response to be a bash-like fenced block so ordinary
+    # code examples, prose, and mixed Markdown stay visible to the caller.
+    shell_block = re.fullmatch(r"\s*```(?:bash|sh|shell)\s*\n(.+?)\n?```\s*", content, re.DOTALL | re.IGNORECASE)
+    if shell_block:
+        command = shell_block.group(1).strip()
+        if command:
+            return "", [{
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": json.dumps({"command": command}, ensure_ascii=False),
+                },
+            }]
 
     return content, []
